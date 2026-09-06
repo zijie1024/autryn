@@ -60,7 +60,7 @@ export function renderWithMemoryStreams(node: ReactNode) {
   return { instance, stdout, stderr, stdin };
 }
 
-/** 让 Ink/React 在断言前冲刷 effects 与批量输出。 */
-export function nextRenderTick(ms = 60): Promise<void> {
+/** 让 Ink/React 在断言前完成异步 effects 与批量输出；CI Runner 的首次渲染可能稍慢。 */
+export function nextRenderTick(ms = 150): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
