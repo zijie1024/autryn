@@ -54,8 +54,8 @@ export function renderWithMemoryStreams(node: ReactNode) {
   const stderr = new MemoryStdout();
   const stdin = createFakeStdin();
   // Ink 的公开类型要求 TTY 流；这些内存替身提供 Ink 实际用到的面
-  //（write/read/setRawMode），仅此而已。
-  const options = { stdout, stdin, stderr, patchConsole: false } as unknown as Parameters<typeof render>[1];
+  //（write/read/setRawMode），仅此而已。debug 让 CI 中的交互式帧也写入测试流。
+  const options = { stdout, stdin, stderr, patchConsole: false, debug: true } as unknown as Parameters<typeof render>[1];
   const instance = render(node, options);
   return { instance, stdout, stderr, stdin };
 }
