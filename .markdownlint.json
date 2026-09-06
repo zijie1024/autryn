@@ -1,0 +1,12 @@
+{
+  "fenced-code-language": false,
+  "first-line-h1": false,
+  "first-line-heading": false,
+  "line-length": false,
+  "no-inline-html": false,
+  "no-space-in-code": false,
+  "single-h1": false,
+  "single-title": false,
+  "table-column-style": false,
+  "ul-indent": false
+}

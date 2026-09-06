@@ -1,0 +1,117 @@
+{
+  "name": "autryn",
+  "version": "0.1.0",
+  "description": "Autryn is a lightweight, extensible AI Agent Runtime. It includes an Agent Loop, a Coding Agent, and a CLI.",
+  "author": "zijie1024 <opensource@zijie1024.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zijie1024/autryn.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zijie1024/autryn/issues"
+  },
+  "homepage": "https://github.com/zijie1024/autryn#readme",
+  "engines": {
+    "node": ">=20"
+  },
+  "autryn": {
+    "releaseRepository": "zijie1024/autryn"
+  },
+  "keywords": [
+    "agent",
+    "agent-loop",
+    "coding-agent",
+    "cli"
+  ],
+  "bin": {
+    "autryn": "bin/autryn.mjs"
+  },
+  "files": [
+    "bin",
+    "dist/js/lib",
+    "dist/types"
+  ],
+  "types": "./dist/types/index.d.ts",
+  "main": "./dist/js/lib/index.js",
+  "module": "./dist/js/lib/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/js/lib/index.js"
+    },
+    "./core": {
+      "types": "./dist/types/core/index.d.ts",
+      "import": "./dist/js/lib/core.js"
+    },
+    "./runtime": {
+      "types": "./dist/types/runtime/index.d.ts",
+      "import": "./dist/js/lib/runtime.js"
+    },
+    "./session": {
+      "types": "./dist/types/sessions/index.d.ts",
+      "import": "./dist/js/lib/session.js"
+    },
+    "./coding": {
+      "types": "./dist/types/coding/index.d.ts",
+      "import": "./dist/js/lib/coding.js"
+    },
+    "./memory": {
+      "types": "./dist/types/memory/index.d.ts",
+      "import": "./dist/js/lib/memory.js"
+    },
+    "./providers/openai": {
+      "types": "./dist/types/providers/openai/index.d.ts",
+      "import": "./dist/js/lib/providers/openai.js"
+    },
+    "./providers/anthropic": {
+      "types": "./dist/types/providers/anthropic/index.d.ts",
+      "import": "./dist/js/lib/providers/anthropic.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "type": "module",
+  "scripts": {
+    "build:bin": "bun run scripts/build-bin.mjs",
+    "build:bin:all": "bun run scripts/build-bin.mjs --all",
+    "build:package": "rm -rf dist/package && bun run build:library && bun pm pack --destination dist/package",
+    "build:library": "bun run build:js && bun run build:types",
+    "build:types": "rm -rf dist/types && tsc -p tsconfig.types.json && tsc-alias -p tsconfig.types.json",
+    "release:github:assets": "bun run build:package && bun run build:bin:all",
+    "release:github": "node scripts/publish-github-release.mjs",
+    "build:js": "rm -rf dist/js && bun build ./index.ts --outdir ./dist/js --splitting --target bun && bun build ./src/index.ts --outfile ./dist/js/lib/index.js --target bun && bun build ./src/core/index.ts --outfile ./dist/js/lib/core.js --target bun && bun build ./src/runtime/index.ts --outfile ./dist/js/lib/runtime.js --target bun && bun build ./src/sessions/index.ts --outfile ./dist/js/lib/session.js --target bun && bun build ./src/coding/index.ts --outfile ./dist/js/lib/coding.js --target bun && bun build ./src/memory/index.ts --outfile ./dist/js/lib/memory.js --target bun && bun build ./src/providers/openai/index.ts --outfile ./dist/js/lib/providers/openai.js --target bun && bun build ./src/providers/anthropic/index.ts --outfile ./dist/js/lib/providers/anthropic.js --target bun",
+    "check": "tsc --noEmit && eslint . && bun test",
+    "check:types": "tsc --noEmit",
+    "dev": "bun run index.ts",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.0",
+    "@types/bun": "latest",
+    "@types/react": "^19.2.14",
+    "eslint": "^10.0.2",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-import-x": "^4.16.1",
+    "prettier": "^3.8.1",
+    "react-devtools-core": "^7.0.1",
+    "tsc-alias": "^1.8.16",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.56.1"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.87.0",
+    "commander": "^14.0.3",
+    "gray-matter": "^4.0.3",
+    "ink": "^6.8.0",
+    "ink-markdown": "^1.0.4",
+    "ink-spinner": "^5.0.0",
+    "ink-text-input": "^6.0.0",
+    "marked-terminal": "^7.3.0",
+    "openai": "^6.33.0",
+    "react": "^19.2.4",
+    "yaml": "^2.8.3",
+    "zod": "^4.3.6"
+  },
+  "private": true
+}
