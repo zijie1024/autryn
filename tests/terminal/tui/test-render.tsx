@@ -24,7 +24,7 @@ export class MemoryStdout extends Writable {
 }
 
 export type FakeStdin = Readable & {
-
+   
   setRawMode: (mode: boolean) => void;
   ref: () => void;
   unref: () => void;
@@ -40,7 +40,7 @@ export type FakeStdin = Readable & {
  */
 export function createFakeStdin(): FakeStdin {
   const stdin = new Readable({ read() {} }) as FakeStdin;
-
+   
   stdin.setRawMode = (_mode: boolean) => {};
   stdin.ref = () => {};
   stdin.unref = () => {};

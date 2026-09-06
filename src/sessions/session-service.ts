@@ -1,5 +1,9 @@
 import type { NonSystemMessage } from "@/core";
-import { CONTEXT_SUMMARY_SCHEMA_VERSION, type CompactionNode } from "@/runtime/context";
+import {
+  CONTEXT_SUMMARY_SCHEMA_VERSION,
+  type ContextStateUpdate,
+} from "@/runtime/context";
+import { expandCompletedPhaseCheckpoints, validateFrontier } from "@/runtime/context/frontier";
 import type {
   ExecutionBranchResult,
   ExecutionResult,
@@ -12,7 +16,6 @@ import { normalizeSessionName, projectKeyFromCwd, sanitizeMessageForPersistence 
 import type {
   Clock,
   ContextCompactionCheckpoint,
-  DurableClearSessionStore,
   IdFactory,
   ModelConfigId,
   LoadedSession,
@@ -69,47 +72,33 @@ export class SessionService {
 
   async materialize(draft: LoadedSession): Promise<SessionRecord> {
     if (!("materialized" in draft)) return draft;
-    const lease = await this.store.acquire(draft.id, { create: true });
-    try {
-      const now = this.clock.now();
-      const record: SessionRecord = {
-        id: draft.id,
-        revision: 1,
-        name: draft.name,
-        createdAt: draft.createdAt,
-        updatedAt: now,
-        workspace: draft.workspace,
-        activeAgentId: draft.activeAgentId,
-        activeAgentGroupId: draft.activeAgentGroupId,
-        agentModelOverrides: draft.agentModelOverrides,
-        activeExecutionMode: draft.activeExecutionMode,
-        messages: [],
-        turns: [],
-        compaction: emptyCompactionState(1, now),
-      };
-      await this.store.commit(lease, 0, record);
-      return record;
-    } finally {
-      await lease.release();
-    }
+    const now = this.clock.now();
+    const record: SessionRecord = {
+      id: draft.id,
+      revision: 1,
+      name: draft.name,
+      createdAt: draft.createdAt,
+      updatedAt: now,
+      workspace: draft.workspace,
+      activeAgentId: draft.activeAgentId,
+      activeAgentGroupId: draft.activeAgentGroupId,
+      agentModelOverrides: draft.agentModelOverrides,
+      activeExecutionMode: draft.activeExecutionMode,
+      messages: [],
+      turns: [],
+      compaction: emptyCompactionState(1, now),
+    };
+    return this.store.create(record);
   }
 
   async rename(session: LoadedSession, name: string): Promise<SessionRecord> {
     const record = await this.materialize(session);
-    const lease = await this.store.acquire(record.id);
-    try {
-      const current = await this.store.load(record.id);
-      const next = {
-        ...current,
-        revision: current.revision + 1,
-        name: normalizeSessionName(name),
-        updatedAt: this.clock.now(),
-      };
-      await this.store.commit(lease, current.revision, next);
-      return next;
-    } finally {
-      await lease.release();
-    }
+    return this.store.mutate(record.id, (current) => ({
+      ...current,
+      revision: current.revision + 1,
+      name: normalizeSessionName(name),
+      updatedAt: this.clock.now(),
+    }));
   }
 
   async setAgentModelOverride(
@@ -118,20 +107,12 @@ export class SessionService {
     modelConfigId: ModelConfigId,
   ): Promise<SessionRecord> {
     const record = await this.materialize(session);
-    const lease = await this.store.acquire(record.id);
-    try {
-      const current = await this.store.load(record.id);
-      const next = {
-        ...current,
-        revision: current.revision + 1,
-        agentModelOverrides: { ...current.agentModelOverrides, [agentId]: modelConfigId },
-        updatedAt: this.clock.now(),
-      };
-      await this.store.commit(lease, current.revision, next);
-      return next;
-    } finally {
-      await lease.release();
-    }
+    return this.store.mutate(record.id, (current) => ({
+      ...current,
+      revision: current.revision + 1,
+      agentModelOverrides: { ...current.agentModelOverrides, [agentId]: modelConfigId },
+      updatedAt: this.clock.now(),
+    }));
   }
 
   async setActiveExecutionMode(
@@ -139,41 +120,31 @@ export class SessionService {
     activeExecutionMode: "execute" | "dry_run",
   ): Promise<SessionRecord> {
     const record = await this.materialize(session);
-    const lease = await this.store.acquire(record.id);
-    try {
-      const current = await this.store.load(record.id);
-      const next = { ...current, revision: current.revision + 1, activeExecutionMode, updatedAt: this.clock.now() };
-      await this.store.commit(lease, current.revision, next);
-      return next;
-    } finally {
-      await lease.release();
-    }
+    return this.store.mutate(record.id, (current) => ({
+      ...current,
+      revision: current.revision + 1,
+      activeExecutionMode,
+      updatedAt: this.clock.now(),
+    }));
   }
 
   async clear(session: LoadedSession): Promise<SessionRecord> {
     const record = await this.materialize(session);
-    const lease = await this.store.acquire(record.id);
-    try {
-      const current = await this.store.load(record.id);
-      const now = this.clock.now();
-      const next: SessionRecord = {
-        ...current,
-        revision: current.revision + 1,
-        updatedAt: now,
-        messages: [],
-        compaction: emptyCompactionState(current.revision, now),
-        turns: current.turns.map((turn) => (turn.status === "running" ? interruptedTurn(turn, now) : turn)),
-      };
-      const store = this.store;
-      if (isDurableClearStore(store)) {
-        await store.commitClear(lease, current.revision, next);
-      } else {
-        await store.commit(lease, current.revision, next);
-      }
-      return next;
-    } finally {
-      await lease.release();
-    }
+    return this.store.mutate(
+      record.id,
+      (current) => {
+        const now = this.clock.now();
+        return {
+          ...current,
+          revision: current.revision + 1,
+          updatedAt: now,
+          messages: [],
+          compaction: emptyCompactionState(current.revision + 1, now),
+          turns: current.turns.map((turn) => (turn.status === "running" ? interruptedTurn(turn, now) : turn)),
+        };
+      },
+      { operation: "clear" },
+    );
   }
 
   async beginTurn(
@@ -181,11 +152,10 @@ export class SessionService {
     group: { id: string; revision: string },
   ): Promise<{ record: SessionRecord; turn: PersistedTurn }> {
     const record = await this.materialize(session);
-    const lease = await this.store.acquire(record.id);
-    try {
-      const current = await this.store.load(record.id);
+    let turn!: PersistedTurn;
+    const next = await this.store.mutate(record.id, (current) => {
       const now = this.clock.now();
-      const turn: PersistedTurn = {
+      turn = {
         id: this.ids.turnId(),
         status: "running",
         startedAt: now,
@@ -196,44 +166,208 @@ export class SessionService {
         agentGroupRevision: group.revision,
         effectiveModels: [],
       };
-      const next = { ...current, revision: current.revision + 1, updatedAt: now, turns: [...current.turns, turn] };
-      await this.store.commit(lease, current.revision, next);
-      return { record: next, turn };
-    } finally {
-      await lease.release();
+      return { ...current, revision: current.revision + 1, updatedAt: now, turns: [...current.turns, turn] };
+    });
+    return { record: next, turn };
+  }
+
+  prepareMessages(turnId: string, messages: NonSystemMessage[]): PersistedSessionMessage[] {
+    const committedAt = this.clock.now();
+    return messages.map((message) => ({
+      id: this.ids.messageId(),
+      turnId,
+      committedAt,
+      message: sanitizeMessageForPersistence(message),
+    }));
+  }
+
+  async startTurn(
+    session: LoadedSession,
+    group: { id: string; revision: string },
+    userMessage: NonSystemMessage,
+    contextPolicyVersion?: string,
+  ): Promise<{ record: SessionRecord; turn: PersistedTurn }> {
+    const turnId = this.ids.turnId();
+    const persistedUserMessage = this.prepareMessages(turnId, [userMessage])[0]!;
+    const build = (current: SessionRecord): { record: SessionRecord; turn: PersistedTurn } => {
+      const now = this.clock.now();
+      const revision = current.revision + 1;
+      const turn: PersistedTurn = {
+        id: turnId,
+        status: "running",
+        startedAt: now,
+        executionMode: current.activeExecutionMode,
+        initialAgentId: current.activeAgentId,
+        handoffs: [],
+        agentGroupId: group.id,
+        agentGroupRevision: group.revision,
+        effectiveModels: [],
+      };
+      let compaction = current.compaction;
+      if (contextPolicyVersion && !current.compaction.phases.some((phase) => phase.status === "active")) {
+        const phaseId = this.ids.turnId();
+        const nextObjective = current.compaction.checkpoint.nextPhaseObjective;
+        compaction = {
+          version: 1,
+          phases: [
+            ...current.compaction.phases,
+            {
+              id: phaseId,
+              status: "active",
+              objective: nextObjective ?? "Initial phase",
+              startedTurnId: turnId,
+              createdAt: now,
+            },
+          ],
+          nodes: current.compaction.nodes,
+          checkpoint: {
+            sourceRevision: revision,
+            frontierNodeIds: current.compaction.checkpoint.frontierNodeIds,
+            activePhaseId: phaseId,
+            nextPhaseObjective: null,
+            policyVersion: contextPolicyVersion,
+            summarySchemaVersion: CONTEXT_SUMMARY_SCHEMA_VERSION,
+            updatedAt: now,
+          },
+        };
+      }
+      return {
+        turn,
+        record: {
+          ...current,
+          revision,
+          updatedAt: now,
+          messages: appendUniqueMessages(current.messages, [persistedUserMessage]),
+          turns: [...current.turns, turn],
+          compaction,
+        },
+      };
+    };
+
+    if ("materialized" in session) {
+      const now = this.clock.now();
+      const initial: SessionRecord = {
+        id: session.id,
+        revision: 0,
+        name: session.name,
+        createdAt: session.createdAt,
+        updatedAt: now,
+        workspace: session.workspace,
+        activeAgentId: session.activeAgentId,
+        activeAgentGroupId: session.activeAgentGroupId,
+        agentModelOverrides: session.agentModelOverrides,
+        activeExecutionMode: session.activeExecutionMode,
+        messages: [],
+        turns: [],
+        compaction: emptyCompactionState(1, now),
+      };
+      const started = build(initial);
+      return { record: await this.store.create(started.record), turn: started.turn };
     }
+
+    let turn!: PersistedTurn;
+    const next = await this.store.mutate(session.id, (current) => {
+      const started = build(current);
+      turn = started.turn;
+      return started.record;
+    });
+    return { record: next, turn };
   }
 
   async appendMessages(sessionId: string, turnId: string, messages: NonSystemMessage[]): Promise<SessionRecord> {
-    const lease = await this.store.acquire(sessionId);
-    try {
-      const current = await this.store.load(sessionId);
+    return this.checkpointTurn(sessionId, turnId, { messages: this.prepareMessages(turnId, messages) });
+  }
+
+  async checkpointTurn(
+    sessionId: string,
+    turnId: string,
+    input: {
+      messages?: PersistedSessionMessage[];
+      effectiveModels?: PersistedTurn["effectiveModels"];
+    },
+  ): Promise<SessionRecord> {
+    return this.store.mutate(sessionId, (current) => {
+      const turn = current.turns.find((candidate) => candidate.id === turnId);
+      if (!turn || turn.status !== "running") {
+        throw new SessionError("INVALID_SESSION_RECORD", `Turn ${turnId} is not running.`);
+      }
+      const messages = appendUniqueMessages(
+        current.messages,
+        (input.messages ?? []).filter((message) => message.turnId === turnId),
+      ).slice(current.messages.length);
+      const existingModelIds = new Set(turn.effectiveModels.map((model) => model.executionId));
+      const effectiveModels = (input.effectiveModels ?? []).filter(
+        (model) => !existingModelIds.has(model.executionId),
+      );
+      if (messages.length === 0 && effectiveModels.length === 0) return null;
+      const next = {
+        ...current,
+        revision: current.revision + 1,
+        updatedAt: this.clock.now(),
+        messages: [...current.messages, ...messages],
+        turns: current.turns.map((candidate) =>
+          candidate.id === turnId
+            ? { ...candidate, effectiveModels: [...candidate.effectiveModels, ...effectiveModels] }
+            : candidate,
+        ),
+      };
+      return next;
+    });
+  }
+
+  async commitHandoff(
+    sessionId: string,
+    turnId: string,
+    input: {
+      messages?: PersistedSessionMessage[];
+      effectiveModels?: PersistedTurn["effectiveModels"];
+      handoff: HandoffRecord;
+    },
+  ): Promise<SessionRecord> {
+    return this.store.mutate(sessionId, (current) => {
       const now = this.clock.now();
-      const persisted: PersistedSessionMessage[] = messages.map((message) => ({
-        id: this.ids.messageId(),
-        turnId,
-        committedAt: now,
-        message: sanitizeMessageForPersistence(message),
-      }));
+      const turn = current.turns.find((candidate) => candidate.id === turnId);
+      if (!turn || turn.status !== "running") {
+        throw new SessionError("INVALID_SESSION_RECORD", `Turn ${turnId} is not running.`);
+      }
+      const messages = appendUniqueMessages(
+        current.messages,
+        (input.messages ?? []).filter((message) => message.turnId === turnId),
+      ).slice(current.messages.length);
+      const existingModelIds = new Set(turn.effectiveModels.map((model) => model.executionId));
+      const effectiveModels = (input.effectiveModels ?? []).filter(
+        (model) => !existingModelIds.has(model.executionId),
+      );
+      const handoffs = turn.handoffs ?? [];
+      const alreadyRecorded = handoffs.some(
+        (candidate) => candidate.successorExecutionId === input.handoff.successorExecutionId,
+      );
+      if (alreadyRecorded && messages.length === 0 && effectiveModels.length === 0) return null;
       const next = {
         ...current,
         revision: current.revision + 1,
         updatedAt: now,
-        messages: [...current.messages, ...persisted],
+        activeAgentId: input.handoff.targetAgentId,
+        messages: [...current.messages, ...messages],
+        turns: current.turns.map((candidate) =>
+          candidate.id !== turnId
+            ? candidate
+            : {
+                ...candidate,
+                handoffs: alreadyRecorded ? handoffs : [...handoffs, input.handoff],
+                effectiveModels: [...candidate.effectiveModels, ...effectiveModels],
+              },
+        ),
       };
-      await this.store.commit(lease, current.revision, next);
       return next;
-    } finally {
-      await lease.release();
-    }
+    });
   }
 
   async recordHandoff(sessionId: string, turnId: string, record: HandoffRecord): Promise<SessionRecord> {
-    const lease = await this.store.acquire(sessionId);
-    try {
-      const current = await this.store.load(sessionId);
+    return this.store.mutate(sessionId, (current) => {
       const now = this.clock.now();
       let found = false;
+      let changed = false;
       const turns = current.turns.map((turn) => {
         if (turn.id !== turnId) return turn;
         found = true;
@@ -244,9 +378,11 @@ export class SessionService {
         if (handoffs.some((candidate) => candidate.successorExecutionId === record.successorExecutionId)) {
           return turn;
         }
+        changed = true;
         return { ...turn, handoffs: [...handoffs, record] };
       });
       if (!found) throw new SessionError("SESSION_NOT_FOUND", `Turn ${turnId} was not found.`);
+      if (!changed) return null;
       const next = {
         ...current,
         revision: current.revision + 1,
@@ -254,11 +390,8 @@ export class SessionService {
         activeAgentId: record.targetAgentId,
         turns,
       };
-      await this.store.commit(lease, current.revision, next);
       return next;
-    } finally {
-      await lease.release();
-    }
+    });
   }
 
   async finishTurn(
@@ -266,11 +399,23 @@ export class SessionService {
     turnId: string,
     result: ExecutionResult | ExecutionBranchResult,
     effectiveModels: PersistedTurn["effectiveModels"] = [],
+    options: {
+      messages?: PersistedSessionMessage[];
+      phaseTransition?: { nextObjective: string; policyVersion: string };
+    } = {},
   ): Promise<SessionRecord> {
-    const lease = await this.store.acquire(sessionId);
-    try {
-      const current = await this.store.load(sessionId);
+    return this.store.mutate(sessionId, (current) => {
       const now = this.clock.now();
+      const messages = appendUniqueMessages(
+        current.messages,
+        (options.messages ?? []).filter((message) => message.turnId === turnId),
+      ).slice(current.messages.length);
+      const persistedMessages = repairIncompleteToolUses(
+        [...current.messages, ...messages],
+        new Set([turnId]),
+        now,
+        () => this.ids.messageId(),
+      );
       const turns = current.turns.map((turn) => {
         if (turn.id !== turnId) return turn;
         return {
@@ -282,7 +427,7 @@ export class SessionService {
           initialAgentId: "initialAgentId" in result ? result.initialAgentId : result.agentId,
           finalAgentId: "finalAgentId" in result ? result.finalAgentId : result.agentId,
           handoffs: "handoffs" in result ? result.handoffs : [],
-          effectiveModels,
+          effectiveModels: mergeEffectiveModels(turn.effectiveModels, effectiveModels),
           ...(result.mode === "dry_run" && "dryRunReport" in result && result.dryRunReport
             ? { dryRunReport: result.dryRunReport }
             : {}),
@@ -296,18 +441,50 @@ export class SessionService {
         throw new SessionError("SESSION_NOT_FOUND", `Turn ${turnId} was not found.`);
       }
       const handoffResult = "handoffs" in result && result.handoffs.length > 0;
+      const revision = current.revision + 1;
+      let compaction = current.compaction;
+      if (options.phaseTransition && result.status === "completed") {
+        const completedPhaseIds = new Set(
+          current.compaction.phases.filter((phase) => phase.status === "active").map((phase) => phase.id),
+        );
+        const frontierNodeIds = expandCompletedPhaseCheckpoints(
+          current.compaction.checkpoint.frontierNodeIds,
+          current.compaction.nodes,
+          completedPhaseIds,
+        );
+        if (!frontierNodeIds) {
+          throw new SessionError("INVALID_SESSION_RECORD", "Completed Phase checkpoint cannot be expanded safely.");
+        }
+        compaction = {
+          version: 1,
+          phases: current.compaction.phases.map((phase) =>
+            phase.status === "active"
+              ? { ...phase, status: "completed" as const, endedTurnId: turnId, completedAt: now }
+              : phase,
+          ),
+          nodes: current.compaction.nodes,
+          checkpoint: {
+            sourceRevision: revision,
+            frontierNodeIds,
+            activePhaseId: null,
+            nextPhaseObjective: options.phaseTransition.nextObjective,
+            policyVersion: options.phaseTransition.policyVersion,
+            summarySchemaVersion: CONTEXT_SUMMARY_SCHEMA_VERSION,
+            updatedAt: now,
+          },
+        };
+      }
       const next = {
         ...current,
-        revision: current.revision + 1,
+        revision,
         updatedAt: now,
+        messages: persistedMessages,
         ...(handoffResult && "finalAgentId" in result ? { activeAgentId: result.finalAgentId } : {}),
         turns,
+        compaction,
       };
-      await this.store.commit(lease, current.revision, next);
       return next;
-    } finally {
-      await lease.release();
-    }
+    });
   }
 
   async appendEffectiveModel(
@@ -315,12 +492,10 @@ export class SessionService {
     turnId: string,
     model: PersistedTurn["effectiveModels"][number],
   ): Promise<SessionRecord> {
-    const lease = await this.store.acquire(sessionId);
-    try {
-      const current = await this.store.load(sessionId);
+    return this.store.mutate(sessionId, (current) => {
       const turn = current.turns.find((candidate) => candidate.id === turnId);
-      if (!turn || turn.status !== "running") return current;
-      if (turn.effectiveModels.some((candidate) => candidate.executionId === model.executionId)) return current;
+      if (!turn || turn.status !== "running") return null;
+      if (turn.effectiveModels.some((candidate) => candidate.executionId === model.executionId)) return null;
       const next: SessionRecord = {
         ...current,
         revision: current.revision + 1,
@@ -331,90 +506,65 @@ export class SessionService {
             : candidate,
         ),
       };
-      await this.store.commit(lease, current.revision, next);
       return next;
-    } finally {
-      await lease.release();
-    }
+    });
   }
 
-  async appendCompactionNodes(
-    sessionId: string,
-    input: {
-      nodes: CompactionNode[];
-      frontierNodeIds: string[];
-      policyVersion: string;
-      summarySchemaVersion: number;
-      sourceRevision?: number;
-    },
-  ): Promise<SessionRecord> {
-    const lease = await this.store.acquire(sessionId);
-    try {
-      const current = await this.store.load(sessionId);
-      const now = this.clock.now();
-      const sourceRevision = input.sourceRevision ?? current.revision;
-      const compatible = current.compaction.nodes.filter((node) =>
-        isCompatibleCompactionNode(node, input, current, sourceRevision),
-      );
-      const nodeById = new Map(compatible.map((node) => [node.id, node]));
-      for (const node of input.nodes) {
-        if (isCompatibleCompactionNode(node, input, current, sourceRevision)) {
-          nodeById.set(node.id, node);
+  async commitCompactionState(sessionId: string, update: ContextStateUpdate): Promise<SessionRecord> {
+    return this.store.mutate(sessionId, (current) => {
+      if (update.checkpoint.sourceRevision > current.revision) {
+        throw new SessionError("INVALID_SESSION_RECORD", "Compaction checkpoint comes from a future Session revision.");
+      }
+      const nodeById = new Map(current.compaction.nodes.map((node) => [node.id, node]));
+      for (const node of update.appendNodes) {
+        const existing = nodeById.get(node.id);
+        if (existing && JSON.stringify(existing) !== JSON.stringify(node)) {
+          throw new SessionError("INVALID_SESSION_RECORD", `Compaction node ${node.id} conflicts with existing state.`);
         }
+        nodeById.set(node.id, node);
       }
       const nodes = [...nodeById.values()];
-      const allNodeIds = new Set(nodes.map((node) => node.id));
-      if (input.frontierNodeIds.some((id) => !allNodeIds.has(id))) {
-        throw new SessionError("INVALID_SESSION_RECORD", "Compaction frontier references an unavailable node.");
+      const sources = sessionContextSources(current);
+      const phases = current.compaction.phases.map((phase) => ({
+        id: phase.id,
+        status: phase.status,
+        startedTurnId: phase.startedTurnId,
+        ...(phase.endedTurnId ? { endedTurnId: phase.endedTurnId } : {}),
+      }));
+      const checkpointValid = validateFrontier({
+        checkpoint: update.checkpoint,
+        nodes,
+        sources,
+        phases,
+        currentSourceRevision: current.revision,
+        expectedSummarySchemaVersion: CONTEXT_SUMMARY_SCHEMA_VERSION,
+        requireStableAnchors: true,
+      });
+      if (
+        !checkpointValid ||
+        update.appendNodes.some((node) => !checkpointValid.reachableNodeIds.has(node.id))
+      ) {
+        throw new SessionError("INVALID_SESSION_RECORD", "Compaction checkpoint does not cover a valid source frontier.");
       }
-      const frontierNodeIds = [...new Set(input.frontierNodeIds)];
       const unchanged =
-        sameIds(current.compaction.nodes, nodes) &&
-        sameStrings(current.compaction.checkpoint.frontierNodeIds, frontierNodeIds) &&
-        current.compaction.checkpoint.policyVersion === input.policyVersion &&
-        current.compaction.checkpoint.summarySchemaVersion === input.summarySchemaVersion &&
-        current.compaction.checkpoint.sourceRevision === sourceRevision;
-      if (unchanged) return current;
-      const next: SessionRecord = {
+        JSON.stringify(current.compaction.nodes) === JSON.stringify(nodes) &&
+        sameCheckpoint(current.compaction.checkpoint, update.checkpoint);
+      if (unchanged) return null;
+      const now = this.clock.now();
+      return {
         ...current,
         revision: current.revision + 1,
         updatedAt: now,
-        compaction: {
-          version: 1,
-          phases: current.compaction.phases,
-          nodes,
-          checkpoint: {
-            sourceRevision,
-            frontierNodeIds,
-            ...(current.compaction.checkpoint.recentStartTurnId
-              ? { recentStartTurnId: current.compaction.checkpoint.recentStartTurnId }
-              : {}),
-            ...(current.compaction.checkpoint.activePhaseId
-              ? { activePhaseId: current.compaction.checkpoint.activePhaseId }
-              : {}),
-            ...(current.compaction.checkpoint.nextPhaseObjective
-              ? { nextPhaseObjective: current.compaction.checkpoint.nextPhaseObjective }
-              : {}),
-            policyVersion: input.policyVersion,
-            summarySchemaVersion: input.summarySchemaVersion,
-            updatedAt: now,
-          },
-        },
+        compaction: { version: 1, phases: current.compaction.phases, nodes, checkpoint: update.checkpoint },
       };
-      await this.store.commit(lease, current.revision, next);
-      return next;
-    } finally {
-      await lease.release();
-    }
+    });
   }
 
   async ensureCompactionState(sessionId: string, turnId: string, policyVersion: string): Promise<SessionRecord> {
-    const lease = await this.store.acquire(sessionId);
-    try {
-      const current = await this.store.load(sessionId);
+    return this.store.mutate(sessionId, (current) => {
       const now = this.clock.now();
       const hasActivePhase = current.compaction.phases.some((phase) => phase.status === "active");
-      if (hasActivePhase) return current;
+      if (hasActivePhase) return null;
       const nextObjective = current.compaction.checkpoint.nextPhaseObjective;
       const phaseId = this.ids.turnId();
       const next: SessionRecord = {
@@ -438,17 +588,15 @@ export class SessionService {
             sourceRevision: current.revision,
             frontierNodeIds: current.compaction.checkpoint.frontierNodeIds,
             activePhaseId: phaseId,
+            nextPhaseObjective: null,
             policyVersion,
             summarySchemaVersion: CONTEXT_SUMMARY_SCHEMA_VERSION,
             updatedAt: now,
           },
         },
       };
-      await this.store.commit(lease, current.revision, next);
       return next;
-    } finally {
-      await lease.release();
-    }
+    });
   }
 
   async transitionCompactionPhase(
@@ -457,10 +605,19 @@ export class SessionService {
     nextObjective: string,
     policyVersion: string,
   ): Promise<SessionRecord> {
-    const lease = await this.store.acquire(sessionId);
-    try {
-      const current = await this.store.load(sessionId);
+    return this.store.mutate(sessionId, (current) => {
       const now = this.clock.now();
+      const completedPhaseIds = new Set(
+        current.compaction.phases.filter((phase) => phase.status === "active").map((phase) => phase.id),
+      );
+      const frontierNodeIds = expandCompletedPhaseCheckpoints(
+        current.compaction.checkpoint.frontierNodeIds,
+        current.compaction.nodes,
+        completedPhaseIds,
+      );
+      if (!frontierNodeIds) {
+        throw new SessionError("INVALID_SESSION_RECORD", "Completed Phase checkpoint cannot be expanded safely.");
+      }
       const phases = current.compaction.phases.map((phase) =>
         phase.status === "active"
           ? { ...phase, status: "completed" as const, endedTurnId: turnId, completedAt: now }
@@ -475,11 +632,9 @@ export class SessionService {
           phases,
           nodes: current.compaction.nodes,
           checkpoint: {
-            sourceRevision: current.revision,
-            frontierNodeIds: current.compaction.checkpoint.frontierNodeIds,
-            ...(current.compaction.checkpoint.recentStartTurnId
-              ? { recentStartTurnId: current.compaction.checkpoint.recentStartTurnId }
-              : {}),
+            sourceRevision: current.revision + 1,
+            frontierNodeIds,
+            activePhaseId: null,
             nextPhaseObjective: nextObjective,
             policyVersion,
             summarySchemaVersion: CONTEXT_SUMMARY_SCHEMA_VERSION,
@@ -487,31 +642,90 @@ export class SessionService {
           },
         },
       };
-      await this.store.commit(lease, current.revision, next);
       return next;
-    } finally {
-      await lease.release();
-    }
+    });
   }
 
   async repairInterrupted(record: SessionRecord): Promise<SessionRecord> {
-    if (!record.turns.some((turn) => turn.status === "running")) return record;
-    const lease = await this.store.acquire(record.id);
-    try {
-      const current = await this.store.load(record.id);
+    return this.store.mutate(record.id, (current) => {
+      const runningTurnIds = new Set(
+        current.turns.filter((turn) => turn.status === "running").map((turn) => turn.id),
+      );
+      if (runningTurnIds.size === 0) return null;
       const now = this.clock.now();
+      const messages = repairIncompleteToolUses(
+        current.messages,
+        runningTurnIds,
+        now,
+        () => this.ids.messageId(),
+      );
       const next = {
         ...current,
         revision: current.revision + 1,
         updatedAt: now,
+        messages,
         turns: current.turns.map((turn) => (turn.status === "running" ? interruptedTurn(turn, now) : turn)),
       };
-      await this.store.commit(lease, current.revision, next);
       return next;
-    } finally {
-      await lease.release();
-    }
+    });
   }
+}
+
+function repairIncompleteToolUses(
+  messages: PersistedSessionMessage[],
+  runningTurnIds: ReadonlySet<string>,
+  committedAt: string,
+  createMessageId: () => string,
+): PersistedSessionMessage[] {
+  const result: PersistedSessionMessage[] = [];
+  const messageIds = new Set(messages.map((message) => message.id));
+
+  for (let index = 0; index < messages.length; index++) {
+    const entry = messages[index]!;
+    result.push(entry);
+    if (entry.message.role !== "assistant" || !runningTurnIds.has(entry.turnId)) continue;
+
+    const toolUses = entry.message.content.filter((content) => content.type === "tool_use");
+    if (toolUses.length === 0) continue;
+
+    const toolUseIds = new Set(toolUses.map((toolUse) => toolUse.id));
+    const completed = new Set<string>();
+    while (index + 1 < messages.length) {
+      const candidate = messages[index + 1]!;
+      if (candidate.message.role !== "tool") break;
+      const matched = candidate.message.content.filter((content) => toolUseIds.has(content.tool_use_id));
+      if (matched.length === 0) break;
+      for (const content of matched) completed.add(content.tool_use_id);
+      result.push(candidate);
+      index++;
+    }
+
+    const missing = toolUses.filter((toolUse) => !completed.has(toolUse.id));
+    if (missing.length === 0) continue;
+
+    let id = createMessageId();
+    while (messageIds.has(id)) id = crypto.randomUUID();
+    messageIds.add(id);
+    result.push({
+      id,
+      turnId: entry.turnId,
+      committedAt,
+      message: {
+        role: "tool",
+        content: missing.map((toolUse) => ({
+          type: "tool_result",
+          tool_use_id: toolUse.id,
+          content: JSON.stringify({
+            ok: false,
+            code: "EXECUTION_INTERRUPTED",
+            error: "Tool execution ended before a durable result was recorded.",
+          }),
+        })),
+      },
+    });
+  }
+
+  return result;
 }
 
 function interruptedTurn(turn: PersistedTurn, finishedAt: string): PersistedTurn {
@@ -532,8 +746,36 @@ function toTurnStatus(status: ExecutionTerminalStatus): PersistedTurn["status"] 
   return status;
 }
 
-function isDurableClearStore(store: SessionStore): store is DurableClearSessionStore {
-  return typeof (store as Partial<DurableClearSessionStore>).commitClear === "function";
+function mergeEffectiveModels(
+  current: PersistedTurn["effectiveModels"],
+  incoming: PersistedTurn["effectiveModels"],
+): PersistedTurn["effectiveModels"] {
+  const byExecutionId = new Map(current.map((model) => [model.executionId, model]));
+  for (const model of incoming) byExecutionId.set(model.executionId, model);
+  return [...byExecutionId.values()];
+}
+
+function appendUniqueMessages(
+  current: PersistedSessionMessage[],
+  incoming: PersistedSessionMessage[],
+): PersistedSessionMessage[] {
+  const result = [...current];
+  const byId = new Map(result.map((message) => [message.id, message]));
+  for (const message of incoming) {
+    const existing = byId.get(message.id);
+    if (existing) {
+      if (JSON.stringify(existing.message) === JSON.stringify(message.message)) continue;
+      let id = crypto.randomUUID();
+      while (byId.has(id)) id = crypto.randomUUID();
+      const unique = { ...message, id };
+      result.push(unique);
+      byId.set(id, unique);
+      continue;
+    }
+    result.push(message);
+    byId.set(message.id, message);
+  }
+  return result;
 }
 
 function emptyCompactionState(sourceRevision: number, now: string) {
@@ -544,6 +786,8 @@ function emptyCompactionState(sourceRevision: number, now: string) {
     checkpoint: {
       sourceRevision,
       frontierNodeIds: [],
+      activePhaseId: null,
+      nextPhaseObjective: null,
       policyVersion: "context-v1",
       summarySchemaVersion: CONTEXT_SUMMARY_SCHEMA_VERSION,
       updatedAt: now,
@@ -551,30 +795,47 @@ function emptyCompactionState(sourceRevision: number, now: string) {
   };
 }
 
-function isCompatibleCompactionNode(
-  node: CompactionNode,
-  input: { policyVersion: string; summarySchemaVersion: number },
-  session: SessionRecord,
-  sourceRevision: number,
-): boolean {
-  if (node.policyVersion !== input.policyVersion || node.summarySchemaVersion !== input.summarySchemaVersion) {
-    return false;
+function sessionContextSources(session: SessionRecord) {
+  const turnIndexById = new Map<string, number>();
+  const turnIds: string[] = [];
+  for (const message of session.messages) {
+    if (!turnIndexById.has(message.turnId)) {
+      turnIndexById.set(message.turnId, turnIndexById.size);
+      turnIds.push(message.turnId);
+    }
   }
-  if (node.source.sourceRevision && node.source.sourceRevision > sourceRevision) return false;
-  if (!node.source.firstMessageId || !node.source.lastMessageId) return true;
-
-  const firstIndex = session.messages.findIndex((message) => message.id === node.source.firstMessageId);
-  const lastIndex = session.messages.findIndex((message) => message.id === node.source.lastMessageId);
-  if (firstIndex < 0 || lastIndex < firstIndex) return false;
-  if (node.source.firstTurnId && session.messages[firstIndex]?.turnId !== node.source.firstTurnId) return false;
-  if (node.source.lastTurnId && session.messages[lastIndex]?.turnId !== node.source.lastTurnId) return false;
-  return true;
+  const phaseByTurnId = new Map<string, { id: string; status: "active" | "completed" }>();
+  for (const phase of session.compaction.phases) {
+    const start = turnIndexById.get(phase.startedTurnId);
+    const end = phase.endedTurnId ? turnIndexById.get(phase.endedTurnId) : turnIds.length - 1;
+    if (start === undefined || end === undefined) continue;
+    for (let turnIndex = start; turnIndex <= end; turnIndex++) {
+      const turnId = turnIds[turnIndex];
+      if (turnId) phaseByTurnId.set(turnId, { id: phase.id, status: phase.status });
+    }
+  }
+  return session.messages.map((entry) => {
+    const phase = phaseByTurnId.get(entry.turnId);
+    return {
+      messageId: entry.id,
+      turnId: entry.turnId,
+      turnIndex: turnIndexById.get(entry.turnId) ?? 0,
+      ...(phase ? { phaseId: phase.id, phaseStatus: phase.status } : {}),
+      sourceRevision: session.revision,
+    };
+  });
 }
 
-function sameIds(left: CompactionNode[], right: CompactionNode[]): boolean {
-  return left.length === right.length && left.every((node, index) => node.id === right[index]?.id);
-}
-
-function sameStrings(left: string[], right: string[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index]);
+function sameCheckpoint(
+  left: SessionRecord["compaction"]["checkpoint"],
+  right: SessionRecord["compaction"]["checkpoint"],
+): boolean {
+  return (
+    left.sourceRevision === right.sourceRevision &&
+    JSON.stringify(left.frontierNodeIds) === JSON.stringify(right.frontierNodeIds) &&
+    (left.activePhaseId ?? null) === (right.activePhaseId ?? null) &&
+    (left.nextPhaseObjective ?? null) === (right.nextPhaseObjective ?? null) &&
+    left.policyVersion === right.policyVersion &&
+    left.summarySchemaVersion === right.summarySchemaVersion
+  );
 }

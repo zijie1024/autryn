@@ -17,6 +17,36 @@ export interface ContextSourceRange {
   sourceRevision?: number;
 }
 
+export interface ContextCompactionCheckpoint {
+  sourceRevision: number;
+  frontierNodeIds: string[];
+  activePhaseId?: string | null;
+  nextPhaseObjective?: string | null;
+  policyVersion: string;
+  summarySchemaVersion: number;
+  updatedAt: string;
+}
+
+export interface ContextRestoreState {
+  currentSourceRevision: number;
+  sources: readonly ContextSourceMessage[];
+  phases: readonly ContextPhaseState[];
+  nodes: readonly CompactionNode[];
+  checkpoint: ContextCompactionCheckpoint;
+}
+
+export interface ContextPhaseState {
+  id: string;
+  status: "active" | "completed";
+  startedTurnId: string;
+  endedTurnId?: string;
+}
+
+export interface ContextStateUpdate {
+  appendNodes: CompactionNode[];
+  checkpoint: ContextCompactionCheckpoint;
+}
+
 export interface StructuredContextSummary {
   objectives: string[];
   constraints: string[];
@@ -103,18 +133,22 @@ export interface ContextManagerPrepareParams {
   model: Model;
   signal: AbortSignal;
   sources?: ContextSourceMessage[];
+  branchLineageId?: string;
+  canonicalAppendOnly?: boolean;
 }
+
+export type ContextPreparePath = "raw" | "incremental" | "rebuild";
 
 export interface ContextManagerPrepareResult {
   messages: NonSystemMessage[];
-  nodes: CompactionNode[];
-  frontierNodeIds: string[];
-  policyVersion: string;
-  summarySchemaVersion: number;
-  sourceRevision?: number;
   usage: ContextSummaryUsage;
   estimatedTokens: number;
   compacted: boolean;
+  path: ContextPreparePath;
+  reusedNodeCount?: number;
+  createdNodeCount?: number;
+  compactedTurnCount?: number;
+  stateUpdate?: ContextStateUpdate;
 }
 
 export interface ContextManager {

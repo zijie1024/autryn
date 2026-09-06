@@ -24,11 +24,9 @@ afterEach(async () => {
 describe("FileSessionStore", () => {
   test("commits immutable revisions and keeps the latest two snapshots", async () => {
     const store = new FileSessionStore({ sessionsRoot: root, ownerId: "owner" });
-    const lease = await store.acquire(SESSION_ID, { create: true });
-    await store.commit(lease, 0, record(1));
-    await store.commit(lease, 1, { ...record(2), name: "two" });
-    await store.commit(lease, 2, { ...record(3), name: "three" });
-    await lease.release();
+    await store.create(record(1));
+    await store.mutate(SESSION_ID, (current) => ({ ...current, revision: current.revision + 1, name: "two" }));
+    await store.mutate(SESSION_ID, (current) => ({ ...current, revision: current.revision + 1, name: "three" }));
 
     const dir = sessionDirectory(root, SESSION_ID);
     expect(await exists(path.join(dir, "0000000000000001.json"))).toBe(false);
@@ -39,11 +37,17 @@ describe("FileSessionStore", () => {
 
   test("clear commits write an intent and remove old transcript revisions", async () => {
     const store = new FileSessionStore({ sessionsRoot: root, ownerId: "owner" });
-    const lease = await store.acquire(SESSION_ID, { create: true });
-    await store.commit(lease, 0, record(1));
-    await store.commit(lease, 1, recordWithMessage(2));
-    await store.commitClear(lease, 2, record(3));
-    await lease.release();
+    await store.create(record(1));
+    await store.mutate(SESSION_ID, (current) => ({
+      ...current,
+      revision: current.revision + 1,
+      messages: recordWithMessage(2).messages,
+    }));
+    await store.mutate(
+      SESSION_ID,
+      (current) => ({ ...current, revision: current.revision + 1, messages: [] }),
+      { operation: "clear" },
+    );
 
     const dir = sessionDirectory(root, SESSION_ID);
     expect(await exists(path.join(dir, "clear.intent"))).toBe(false);
@@ -53,11 +57,34 @@ describe("FileSessionStore", () => {
     expect((await store.load(SESSION_ID)).messages).toEqual([]);
   });
 
+  test("serializes concurrent mutations before writing file revisions", async () => {
+    const store = new FileSessionStore({ sessionsRoot: root, ownerId: "owner", heartbeatIntervalMs: 0 });
+    await store.create(record(1));
+
+    await Promise.all([
+      store.mutate(SESSION_ID, (current) => ({
+        ...current,
+        revision: current.revision + 1,
+        messages: [...current.messages, persistedMessage("first", "66666666-6666-4666-8666-666666666666")],
+      })),
+      store.mutate(SESSION_ID, (current) => ({
+        ...current,
+        revision: current.revision + 1,
+        messages: [...current.messages, persistedMessage("second", "88888888-8888-4888-8888-888888888888")],
+      })),
+    ]);
+
+    const saved = await store.load(SESSION_ID);
+    expect(saved.revision).toBe(3);
+    expect(saved.messages.map((item) => item.message.content)).toEqual([
+      [{ type: "text", text: "first" }],
+      [{ type: "text", text: "second" }],
+    ]);
+  });
+
   test("unfinished clear intent blocks revival of an old transcript", async () => {
     const store = new FileSessionStore({ sessionsRoot: root, ownerId: "owner" });
-    const lease = await store.acquire(SESSION_ID, { create: true });
-    await store.commit(lease, 0, recordWithMessage(1));
-    await lease.release();
+    await store.create(recordWithMessage(1));
     await writeFile(path.join(sessionDirectory(root, SESSION_ID), "clear.intent"), "{}", "utf8");
 
     await expect(store.load(SESSION_ID)).rejects.toThrow(SessionError);
@@ -66,25 +93,20 @@ describe("FileSessionStore", () => {
     );
   });
 
-  test("exclusive lease and revision CAS reject concurrent writers", async () => {
+  test("exclusive lease rejects concurrent writers and cannot be force-overwritten while live", async () => {
     const first = new FileSessionStore({ sessionsRoot: root, ownerId: "one" });
     const second = new FileSessionStore({ sessionsRoot: root, ownerId: "two" });
-    const lease = await first.acquire(SESSION_ID, { create: true });
+    await first.create(record(1));
+    const lease = await first.acquire(SESSION_ID);
     await expect(second.acquire(SESSION_ID)).rejects.toThrow(SessionError);
-    await first.commit(lease, 0, record(1));
+    await expect(second.acquire(SESSION_ID, { force: true })).rejects.toThrow(SessionError);
     await lease.release();
-
-    const stale = await first.acquire(SESSION_ID);
-    const current = await second.acquire(SESSION_ID, { force: true });
-    await second.commit(current, 1, record(2));
-    await current.release();
-    await expect(first.commit(stale, 1, record(2))).rejects.toThrow(SessionError);
   });
 
   test("same-owner nested lease keeps the outer attach lock until final release", async () => {
     const store = new FileSessionStore({ sessionsRoot: root, ownerId: "owner", heartbeatIntervalMs: 0 });
-    const outer = await store.acquire(SESSION_ID, { create: true });
-    await store.commit(outer, 0, record(1));
+    await store.create(record(1));
+    const outer = await store.acquire(SESSION_ID);
     const nested = await store.acquire(SESSION_ID);
     expect(nested).toBe(outer);
     await nested.release();
@@ -116,9 +138,7 @@ describe("FileSessionStore", () => {
 
   test("stale same-host lease is cleared only when pid is proven dead", async () => {
     const first = new FileSessionStore({ sessionsRoot: root, ownerId: "one", heartbeatIntervalMs: 0 });
-    const lease = await first.acquire(SESSION_ID, { create: true });
-    await first.commit(lease, 0, record(1));
-    await lease.release();
+    await first.create(record(1));
 
     const leasePath = path.join(sessionDirectory(root, SESSION_ID), "lease.json");
     await writeFile(
@@ -140,16 +160,14 @@ describe("FileSessionStore", () => {
       heartbeatIntervalMs: 0,
       processAlive: () => false,
     });
-    const recovered = await second.acquire(SESSION_ID);
+    const recovered = await second.acquire(SESSION_ID, { force: true });
     expect(recovered.ownerId).toBe("two");
     await recovered.release();
   });
 
   test("live same-host lease is not cleared as stale", async () => {
     const first = new FileSessionStore({ sessionsRoot: root, ownerId: "one", heartbeatIntervalMs: 0 });
-    const lease = await first.acquire(SESSION_ID, { create: true });
-    await first.commit(lease, 0, record(1));
-    await lease.release();
+    await first.create(record(1));
 
     const leasePath = path.join(sessionDirectory(root, SESSION_ID), "lease.json");
     await writeFile(
@@ -176,9 +194,7 @@ describe("FileSessionStore", () => {
 
   test("lists corrupted sessions without hiding healthy ones", async () => {
     const store = new FileSessionStore({ sessionsRoot: root, ownerId: "owner" });
-    const lease = await store.acquire(SESSION_ID, { create: true });
-    await store.commit(lease, 0, record(1));
-    await lease.release();
+    await store.create(record(1));
 
     const badId = "22222222-2222-4222-8222-222222222222";
     const badDir = sessionDirectory(root, badId);
@@ -199,20 +215,17 @@ describe("FileSessionStore", () => {
 
   test("delete renames and removes one concrete session directory", async () => {
     const store = new FileSessionStore({ sessionsRoot: root, ownerId: "owner" });
-    const lease = await store.acquire(SESSION_ID, { create: true });
-    await store.commit(lease, 0, record(1));
-    await store.delete(lease, SESSION_ID);
+    await store.create(record(1));
+    await store.deleteSession(SESSION_ID);
     await expect(store.load(SESSION_ID)).rejects.toThrow(SessionError);
   });
 
   test("list marks sessions whose cwd no longer exists", async () => {
     const store = new FileSessionStore({ sessionsRoot: root, ownerId: "owner" });
-    const lease = await store.acquire(SESSION_ID, { create: true });
-    await store.commit(lease, 0, {
+    await store.create({
       ...record(1),
       workspace: { cwd: path.join(root, "missing"), projectKey: "missing" },
     });
-    await lease.release();
 
     expect((await store.list({ includeAllProjects: true })).find((item) => item.id === SESSION_ID)?.health).toBe(
       "cwd_missing",
@@ -221,12 +234,23 @@ describe("FileSessionStore", () => {
 
   test("snapshots do not contain expanded secrets outside model config references", async () => {
     const store = new FileSessionStore({ sessionsRoot: root, ownerId: "owner" });
-    const lease = await store.acquire(SESSION_ID, { create: true });
-    await store.commit(lease, 0, record(1));
-    await lease.release();
+    await store.create(record(1));
     const raw = await readFile(path.join(sessionDirectory(root, SESSION_ID), "0000000000000001.json"), "utf8");
     expect(raw).not.toContain("APIKey");
     expect(raw).not.toContain("sk-");
+  });
+
+  test("rejects an invalid next record before publishing its revision", async () => {
+    const store = new FileSessionStore({ sessionsRoot: root, ownerId: "owner", heartbeatIntervalMs: 0 });
+    await store.create(record(1));
+
+    await expect(
+      store.mutate(SESSION_ID, (current) => ({ ...current, revision: current.revision + 1, name: "" })),
+    ).rejects.toThrow();
+
+    const dir = sessionDirectory(root, SESSION_ID);
+    expect(await exists(path.join(dir, "0000000000000002.json"))).toBe(false);
+    expect((await store.load(SESSION_ID)).revision).toBe(1);
   });
 });
 
@@ -251,6 +275,8 @@ function record(revision: number): SessionRecord {
       checkpoint: {
         sourceRevision: revision,
         frontierNodeIds: [],
+        activePhaseId: null,
+        nextPhaseObjective: null,
         policyVersion: "context-v1",
         summarySchemaVersion: 1,
         updatedAt: "2026-08-27T00:00:00.000Z",
@@ -270,6 +296,15 @@ function recordWithMessage(revision: number): SessionRecord {
         message: { role: "user", content: [{ type: "text", text: "hello" }] },
       },
     ],
+  };
+}
+
+function persistedMessage(text: string, id: string) {
+  return {
+    id,
+    turnId: "77777777-7777-4777-8777-777777777777",
+    committedAt: "2026-08-27T00:00:00.000Z",
+    message: { role: "user" as const, content: [{ type: "text" as const, text }] },
   };
 }
 

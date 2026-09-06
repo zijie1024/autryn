@@ -197,6 +197,7 @@ describe("SessionController", () => {
       onHandoff: (event) => handoffEvents.push(event),
     });
     expect(first).toMatchObject({ finalAgentId: "reviewer", status: "completed" });
+    expect("materialized" in controller.session ? null : controller.session.revision).toBe(4);
     expect(handoffEvents.map((event) => event.status)).toEqual(["requested", "committed"]);
     expect(handoffEvents.at(-1)).toMatchObject({ agentId: "code", targetAgentId: "reviewer" });
     expect(controller.snapshot()).toMatchObject({ activeAgentId: "reviewer", activeAgentMissing: false });

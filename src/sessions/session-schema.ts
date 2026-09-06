@@ -114,9 +114,8 @@ const sessionCompactionStateSchema = z.object({
   checkpoint: z.object({
     sourceRevision: z.number().int().positive(),
     frontierNodeIds: z.array(z.string()),
-    recentStartTurnId: z.string().optional(),
-    activePhaseId: z.string().optional(),
-    nextPhaseObjective: z.string().optional(),
+    activePhaseId: z.string().nullable().optional(),
+    nextPhaseObjective: z.string().nullable().optional(),
     policyVersion: z.string().min(1),
     summarySchemaVersion: z.number().int().positive(),
     updatedAt: z.string().datetime(),

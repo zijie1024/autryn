@@ -56,6 +56,7 @@ export type ExecutionErrorCode =
   | "CONTEXT_SUMMARY_FAILED"
   | "CONTEXT_SUMMARY_INVALID"
   | "CONTEXT_STATE_INVALID"
+  | "CHECKPOINT_FAILED"
   | "INTERNAL_ERROR"
   | "INVALID_DELEGATION_REQUEST";
 export type HandoffErrorCode =
@@ -330,6 +331,34 @@ export interface AgentConfiguration {
 
 export interface AgentRunOptions {
   mode?: ExecutionMode;
+  /** 在需要持久化的执行边界等待调用方完成 checkpoint。 */
+  onCheckpoint?: ExecutionCheckpointHandler;
+}
+
+export type ExecutionCheckpointReason = "tool_call" | "step_completed" | "handoff_committed";
+
+export interface ExecutionCheckpoint {
+  reason: ExecutionCheckpointReason;
+  executionId: string;
+  rootExecutionId: string;
+  branchId: ExecutionBranchId;
+  agentId: AgentId;
+  step: number;
+  messages: NonSystemMessage[];
+  handoff?: HandoffRecord;
+}
+
+export type ExecutionCheckpointHandler = (checkpoint: ExecutionCheckpoint) => Promise<void>;
+
+export class ExecutionCheckpointError extends Error {
+  override readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    super(`Execution checkpoint failed: ${message}`);
+    this.name = "ExecutionCheckpointError";
+    this.cause = cause;
+  }
 }
 
 export interface DelegateCreationContext {

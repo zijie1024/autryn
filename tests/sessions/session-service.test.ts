@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
 import type { UserMessage } from "@/core";
-import type { CompactionNode, ExecutionResult } from "@/runtime";
+import { convertToAnthropicMessages } from "@/providers/anthropic/utils";
+import { convertToOpenAIMessages } from "@/providers/openai/utils";
+import { validateMessageBlocks, type CompactionNode, type ExecutionResult } from "@/runtime";
 import { MemorySessionStore, resolveSessionSelector, SessionError, SessionService } from "@/sessions";
 import type { EffectiveModelSnapshot, SessionRecord } from "@/sessions/session-types";
 
@@ -38,6 +40,8 @@ describe("SessionService with MemorySessionStore", () => {
       checkpoint: {
         sourceRevision: 1,
         frontierNodeIds: [],
+        activePhaseId: null,
+        nextPhaseObjective: null,
         policyVersion: "context-v1",
         summarySchemaVersion: 1,
         updatedAt: "2026-08-27T00:00:00.000Z",
@@ -77,6 +81,177 @@ describe("SessionService with MemorySessionStore", () => {
     expect(session.turns[0]?.status).toBe("failed");
     expect(session.turns[0]?.usage?.totalTokens).toBe(3);
     expect(session.turns[0]?.error?.message).not.toContain("sk-secret-value");
+  });
+
+  test("commits a turn in explicit boundaries instead of per-message mutations", async () => {
+    const store = new MemorySessionStore();
+    const service = makeService(store);
+    const session = await service.materialize(createDraft(service));
+    const userMessage: UserMessage = { role: "user", content: [{ type: "text", text: "hello" }] };
+    const started = await service.startTurn(session, AGENT_GROUP, userMessage);
+
+    expect(started.record.revision).toBe(2);
+    const assistantMessage = {
+      role: "assistant" as const,
+      content: [{ type: "text" as const, text: "working" }],
+    };
+    const toolMessage = {
+      role: "tool" as const,
+      content: [{ type: "tool_result" as const, tool_use_id: "tool-1", content: "done" }],
+    };
+    const afterToolCall = await service.checkpointTurn(session.id, started.turn.id, {
+      messages: service.prepareMessages(started.turn.id, [assistantMessage]),
+      effectiveModels: [{ ...model, executionId: "root", agentId: "agent" }],
+    });
+    const afterStep = await service.checkpointTurn(session.id, started.turn.id, {
+      messages: service.prepareMessages(started.turn.id, [toolMessage]),
+    });
+    const result: ExecutionResult = {
+      executionId: "root",
+      branchId: "root",
+      rootExecutionId: "root",
+      agentId: "agent",
+      status: "completed",
+      mode: "execute",
+      steps: 1,
+      usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2, usageIncomplete: false },
+      durationMs: 1,
+      output: { text: "done", message: assistantMessage },
+    };
+    const finished = await service.finishTurn(session.id, started.turn.id, result, [], {
+      messages: service.prepareMessages(started.turn.id, [
+        { role: "assistant", content: [{ type: "text", text: "done" }] },
+      ]),
+    });
+
+    expect(afterToolCall.revision).toBe(3);
+    expect(afterStep.revision).toBe(4);
+    expect(finished.revision).toBe(5);
+    expect(finished.messages.map((entry) => entry.message.role)).toEqual(["user", "assistant", "tool", "assistant"]);
+    expect(finished.turns[0]?.effectiveModels).toEqual([
+      expect.objectContaining({ executionId: "root", agentId: "agent" }),
+    ]);
+  });
+
+  test("creates a draft's first Turn as one revision", async () => {
+    const store = new MemorySessionStore();
+    const service = makeService(store);
+    const draft = createDraft(service);
+    const started = await service.startTurn(draft, AGENT_GROUP, {
+      role: "user",
+      content: [{ type: "text", text: "hello" }],
+    });
+
+    expect(started.record.revision).toBe(1);
+    expect(started.record.messages).toHaveLength(1);
+    expect(started.record.turns).toHaveLength(1);
+    expect((await store.load(draft.id)).revision).toBe(1);
+  });
+
+  test("repairs an interrupted Tool Call with durable Tool Results", async () => {
+    const store = new MemorySessionStore();
+    const service = makeService(store);
+    const started = await service.startTurn(createDraft(service), AGENT_GROUP, {
+      role: "user",
+      content: [{ type: "text", text: "inspect" }],
+    });
+    const withToolCall = await service.checkpointTurn(started.record.id, started.turn.id, {
+      messages: service.prepareMessages(started.turn.id, [
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "tool-1", name: "read_file", input: { path: "README.md" } },
+            { type: "tool_use", id: "tool-2", name: "read_file", input: { path: "package.json" } },
+          ],
+        },
+      ]),
+    });
+
+    const repaired = await service.repairInterrupted(withToolCall);
+    const messages = repaired.messages.map((entry) => entry.message);
+    const recovery = messages.at(-1);
+
+    expect(repaired.turns[0]?.status).toBe("interrupted");
+    expect(recovery?.role).toBe("tool");
+    expect(recovery?.content).toEqual([
+      expect.objectContaining({ type: "tool_result", tool_use_id: "tool-1" }),
+      expect.objectContaining({ type: "tool_result", tool_use_id: "tool-2" }),
+    ]);
+    expect(() => validateMessageBlocks(messages)).not.toThrow();
+    expect(JSON.stringify(convertToOpenAIMessages(messages))).toContain("EXECUTION_INTERRUPTED");
+    expect(JSON.stringify(convertToAnthropicMessages(messages))).toContain("EXECUTION_INTERRUPTED");
+  });
+
+  test("closes an unfinished Tool Call when a Turn reaches a terminal state", async () => {
+    const store = new MemorySessionStore();
+    const service = makeService(store);
+    const started = await service.startTurn(createDraft(service), AGENT_GROUP, {
+      role: "user",
+      content: [{ type: "text", text: "run" }],
+    });
+    await service.checkpointTurn(started.record.id, started.turn.id, {
+      messages: service.prepareMessages(started.turn.id, [
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "tool-1", name: "write_file", input: { path: "result.txt" } }],
+        },
+      ]),
+    });
+    const cancelled: ExecutionResult = {
+      executionId: "root",
+      rootExecutionId: "root",
+      branchId: "root",
+      agentId: "code",
+      status: "cancelled",
+      mode: "execute",
+      steps: 1,
+      usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2, usageIncomplete: false },
+      durationMs: 1,
+    };
+
+    const finished = await service.finishTurn(started.record.id, started.turn.id, cancelled);
+    const messages = finished.messages.map((entry) => entry.message);
+
+    expect(finished.turns[0]?.status).toBe("cancelled");
+    expect(messages.at(-1)?.role).toBe("tool");
+    expect(() => validateMessageBlocks(messages)).not.toThrow();
+  });
+
+  test("serializes concurrent mutations without losing either update", async () => {
+    const store = new MemorySessionStore();
+    const service = makeService(store);
+    const session = await service.materialize(createDraft(service));
+    const started = await service.beginTurn(session, AGENT_GROUP);
+
+    await Promise.all([
+      service.appendMessages(session.id, started.turn.id, [
+        { role: "user", content: [{ type: "text", text: "first" }] },
+      ]),
+      service.appendMessages(session.id, started.turn.id, [
+        { role: "user", content: [{ type: "text", text: "second" }] },
+      ]),
+    ]);
+
+    const saved = await store.load(session.id);
+    expect(saved.revision).toBe(4);
+    expect(saved.messages.map((item) => item.message.content)).toEqual([
+      [{ type: "text", text: "first" }],
+      [{ type: "text", text: "second" }],
+    ]);
+  });
+
+  test("continues processing a Session after a mutation fails", async () => {
+    const store = new MemorySessionStore();
+    const service = makeService(store);
+    const session = await service.materialize(createDraft(service));
+
+    const failed = store.mutate(session.id, () => {
+      throw new Error("mutation failed");
+    });
+    const next = service.rename(session, "Recovered");
+
+    await expect(failed).rejects.toThrow("mutation failed");
+    await expect(next).resolves.toMatchObject({ name: "Recovered", revision: 2 });
   });
 
   test("persists a committed handoff and advances the active Agent", async () => {
@@ -127,57 +302,127 @@ describe("SessionService with MemorySessionStore", () => {
     const store = new MemorySessionStore();
     const service = makeService(store);
     let session = await service.materialize(createDraft(service));
+    const started = await service.startTurn(session, AGENT_GROUP, {
+      role: "user",
+      content: [{ type: "text", text: "seed compaction" }],
+    });
+    session = await service.checkpointTurn(started.record.id, started.turn.id, {
+      messages: service.prepareMessages(started.turn.id, [
+        { role: "assistant", content: [{ type: "text", text: "seed answer" }] },
+      ]),
+    });
 
-    session = await service.appendCompactionNodes(session.id, {
-      nodes: [compactionNode("node-1")],
-      frontierNodeIds: ["node-1"],
-      policyVersion: "context-v1",
-      summarySchemaVersion: 1,
-      sourceRevision: session.revision,
+    const node1 = compactionNode("node-1", session);
+    session = await service.commitCompactionState(session.id, {
+      appendNodes: [node1],
+      checkpoint: {
+        sourceRevision: session.revision,
+        frontierNodeIds: ["node-1"],
+        activePhaseId: null,
+        nextPhaseObjective: null,
+        policyVersion: "context-v1",
+        summarySchemaVersion: 1,
+        updatedAt: "2026-08-27T00:00:00.000Z",
+      },
     });
     expect(session.compaction.version).toBe(1);
     expect(session.compaction.nodes.map((node) => node.id)).toEqual(["node-1"]);
     expect(session.compaction.checkpoint.frontierNodeIds).toEqual(["node-1"]);
 
-    session = await service.appendCompactionNodes(session.id, {
-      nodes: [compactionNode("node-2")],
-      frontierNodeIds: ["node-2"],
-      policyVersion: "context-v1",
-      summarySchemaVersion: 1,
-      sourceRevision: session.revision,
+    const unchangedRevision = session.revision;
+    session = await service.commitCompactionState(session.id, {
+      appendNodes: [],
+      checkpoint: { ...session.compaction.checkpoint, updatedAt: "2026-08-27T00:00:01.000Z" },
+    });
+    expect(session.revision).toBe(unchangedRevision);
+
+    const node2 = compactionNode("node-2", session);
+    session = await service.commitCompactionState(session.id, {
+      appendNodes: [node2],
+      checkpoint: {
+        sourceRevision: session.revision,
+        frontierNodeIds: ["node-2"],
+        activePhaseId: null,
+        nextPhaseObjective: null,
+        policyVersion: "context-v1",
+        summarySchemaVersion: 1,
+        updatedAt: "2026-08-27T00:00:00.000Z",
+      },
     });
     expect(session.compaction.nodes.map((node) => node.id)).toEqual(["node-1", "node-2"]);
     expect(session.compaction.checkpoint.frontierNodeIds).toEqual(["node-2"]);
 
+    await expect(
+      service.commitCompactionState(session.id, {
+        appendNodes: [compactionNode("unreachable", session)],
+        checkpoint: { ...session.compaction.checkpoint, sourceRevision: session.revision },
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_SESSION_RECORD" });
+
     session = await service.clear(session);
     expect(session.compaction.nodes).toEqual([]);
     expect(session.compaction.checkpoint.frontierNodeIds).toEqual([]);
+    expect(session.compaction.checkpoint.sourceRevision).toBe(session.revision);
   });
 
   test("persists Phase checkpoints and updates the frontier without creating another node", async () => {
     const store = new MemorySessionStore();
     const service = makeService(store);
     let session = await service.materialize(createDraft(service));
-    const checkpoint = { ...compactionNode("phase-checkpoint"), level: "phase" as const, checkpoint: true };
+    const started = await service.startTurn(session, AGENT_GROUP, {
+      role: "user",
+      content: [{ type: "text", text: "seed phase" }],
+    });
+    session = await service.checkpointTurn(started.record.id, started.turn.id, {
+      messages: service.prepareMessages(started.turn.id, [
+        { role: "assistant", content: [{ type: "text", text: "phase answer" }] },
+      ]),
+    });
+    session = await service.ensureCompactionState(session.id, started.turn.id, "context-v1");
+    const turnNode = {
+      ...compactionNode("phase-turn", session),
+      phaseId: session.compaction.checkpoint.activePhaseId!,
+    };
+    const checkpoint = {
+      ...compactionNode("phase-checkpoint", session),
+      level: "phase" as const,
+      phaseId: session.compaction.checkpoint.activePhaseId!,
+      checkpoint: true,
+      childNodeIds: [turnNode.id],
+    };
 
-    session = await service.appendCompactionNodes(session.id, {
-      nodes: [checkpoint],
-      frontierNodeIds: [checkpoint.id],
-      policyVersion: "context-v1",
-      summarySchemaVersion: 1,
-      sourceRevision: session.revision,
+    session = await service.commitCompactionState(session.id, {
+      appendNodes: [turnNode, checkpoint],
+      checkpoint: {
+        sourceRevision: session.revision,
+        frontierNodeIds: [checkpoint.id],
+        activePhaseId: session.compaction.checkpoint.activePhaseId,
+        nextPhaseObjective: null,
+        policyVersion: "context-v1",
+        summarySchemaVersion: 1,
+        updatedAt: "2026-08-27T00:00:00.000Z",
+      },
     });
     const checkpointRevision = session.revision;
     expect(session.compaction.nodes).toContainEqual(checkpoint);
 
-    session = await service.appendCompactionNodes(session.id, {
-      nodes: [],
-      frontierNodeIds: [],
-      policyVersion: "context-v1",
-      summarySchemaVersion: 1,
-      sourceRevision: session.revision,
+    session = await service.transitionCompactionPhase(session.id, started.turn.id, "next objective", "context-v1");
+    expect(session.compaction.checkpoint.frontierNodeIds).toEqual([turnNode.id]);
+    expect(session.compaction.checkpoint.activePhaseId).toBeNull();
+
+    session = await service.commitCompactionState(session.id, {
+      appendNodes: [],
+      checkpoint: {
+        sourceRevision: session.revision,
+        frontierNodeIds: [],
+        activePhaseId: session.compaction.checkpoint.activePhaseId,
+        nextPhaseObjective: null,
+        policyVersion: "context-v1",
+        summarySchemaVersion: 1,
+        updatedAt: "2026-08-27T00:00:00.000Z",
+      },
     });
-    expect(session.revision).toBe(checkpointRevision + 1);
+    expect(session.revision).toBe(checkpointRevision + 2);
     expect(session.compaction.nodes).toContainEqual(checkpoint);
     expect(session.compaction.checkpoint.frontierNodeIds).toEqual([]);
   });
@@ -194,13 +439,13 @@ describe("SessionService with MemorySessionStore", () => {
     session = await service.transitionCompactionPhase(session.id, TURN_ID, "next objective", "context-v1");
     expect(session.compaction.phases.map((phase) => phase.status)).toEqual(["completed"]);
     expect(session.compaction.checkpoint.nextPhaseObjective).toBe("next objective");
-    expect(session.compaction.checkpoint.activePhaseId).toBeUndefined();
+    expect(session.compaction.checkpoint.activePhaseId).toBeNull();
 
     session = await service.ensureCompactionState(session.id, NEXT_TURN_ID, "context-v1");
     expect(session.compaction.phases.map((phase) => phase.status)).toEqual(["completed", "active"]);
     expect(session.compaction.phases[1]?.objective).toBe("next objective");
     expect(session.compaction.phases[1]?.startedTurnId).toBe(NEXT_TURN_ID);
-    expect(session.compaction.checkpoint.nextPhaseObjective).toBeUndefined();
+    expect(session.compaction.checkpoint.nextPhaseObjective).toBeNull();
   });
 
   test("selector resolves id, unique prefix and exact name, and rejects ambiguity", async () => {
@@ -214,14 +459,6 @@ describe("SessionService with MemorySessionStore", () => {
     expect(() => resolveSessionSelector("same", summaries)).toThrow(SessionError);
   });
 
-  test("CAS prevents silent overwrite", async () => {
-    const store = new MemorySessionStore();
-    const lease = await store.acquire(SESSION_ID, { create: true });
-    const record = makeRecord({ id: SESSION_ID, revision: 1 });
-    await store.commit(lease, 0, record);
-    await expect(store.commit(lease, 0, { ...record, revision: 1 })).rejects.toThrow(SessionError);
-    await lease.release();
-  });
 });
 
 function makeService(store: MemorySessionStore) {
@@ -245,12 +482,24 @@ function createDraft(service: SessionService) {
   });
 }
 
-function compactionNode(id: string): CompactionNode {
+function compactionNode(id: string, session: SessionRecord): CompactionNode {
+  const first = session.messages[0]!;
+  const last = session.messages.at(-1)!;
   return {
     id,
     level: "turn",
     checkpoint: false,
-    source: { firstMessageIndex: 0, lastMessageIndex: 1, firstTurnIndex: 0, lastTurnIndex: 0 },
+    source: {
+      firstMessageIndex: 0,
+      lastMessageIndex: session.messages.length - 1,
+      firstTurnIndex: 0,
+      lastTurnIndex: 0,
+      firstMessageId: first.id,
+      lastMessageId: last.id,
+      firstTurnId: first.turnId,
+      lastTurnId: last.turnId,
+      sourceRevision: session.revision,
+    },
     childNodeIds: [],
     summary: {
       objectives: ["objective"],
@@ -292,6 +541,8 @@ function makeRecord(input: { id: string; name?: string | null; revision?: number
       checkpoint: {
         sourceRevision: input.revision ?? 1,
         frontierNodeIds: [],
+        activePhaseId: null,
+        nextPhaseObjective: null,
         policyVersion: "context-v1",
         summarySchemaVersion: 1,
         updatedAt: "2026-08-27T00:00:00.000Z",

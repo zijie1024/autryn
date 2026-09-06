@@ -6,7 +6,12 @@ import {
   AgentRuntime,
   createPhaseTransitionTool,
   RuntimeContextManager,
+  TokenEstimator,
+  type CompactionNode,
+  type ContextPhaseState,
   type ContextManagerPrepareResult,
+  type ContextRestoreState,
+  type ContextSourceMessage,
   type ContextSummaryRequest,
 } from "@/runtime";
 
@@ -43,11 +48,32 @@ class ExpensiveSummarizer extends FixedSummarizer {
   }
 }
 
+class CountingEstimator extends TokenEstimator {
+  messageCount = 0;
+
+  override estimateMessage(message: Parameters<TokenEstimator["estimateMessage"]>[0]): number {
+    this.messageCount++;
+    return super.estimateMessage(message);
+  }
+}
+
+class PredictableEstimator extends TokenEstimator {
+  constructor(private readonly summaryTokens: number) {
+    super();
+  }
+
+  override estimateMessage(message: Parameters<TokenEstimator["estimateMessage"]>[0]): number {
+    const text = JSON.stringify(message);
+    if (text.includes("Context Summary:")) return this.summaryTokens;
+    if (text.includes("current request")) return 10;
+    return 100;
+  }
+}
+
 describe("RuntimeContextManager", () => {
   test("builds a bounded model context without mutating the canonical transcript", async () => {
     const summarizer = new FixedSummarizer();
     const { provider, calls } = createScriptedProvider([() => [finalTextMessage("done", 10)]]);
-    const ids = ["turn-1", "turn-2", "turn-3", "segment-1", "phase-1"];
     const model = new Model("test-model", provider, {}, { contextWindowTokens: 420, maxOutputTokens: 64 });
     const messages = longTranscript();
     const agent = new Agent({
@@ -63,7 +89,7 @@ describe("RuntimeContextManager", () => {
           targetRatio: 0.8,
           safetyMarginTokens: 32,
         },
-        idFactory: () => ids.shift()!,
+        idFactory: sequentialIds(),
         now: () => "2026-08-28T00:00:00.000Z",
       }),
     });
@@ -113,7 +139,7 @@ describe("RuntimeContextManager", () => {
       tools: [tool("read_file")],
       contextManager: new RuntimeContextManager({
         summarizer,
-        policy: { recentTurns: 1, activeTurnRecentBlocks: 3, triggerRatio: 0.1, safetyMarginTokens: 32 },
+        policy: { recentTurns: 2, activeTurnRecentBlocks: 3, triggerRatio: 0.1, safetyMarginTokens: 32 },
       }),
     });
 
@@ -172,8 +198,8 @@ describe("RuntimeContextManager", () => {
     const first = await manager.prepare({ prompt: "Prompt", messages, model, signal: new AbortController().signal });
     const second = await manager.prepare({ prompt: "Prompt", messages, model, signal: new AbortController().signal });
 
-    expect(first.nodes.map((node) => node.id)).toEqual(["node-1"]);
-    expect(second.nodes).toEqual([]);
+    expect(nodesOf(first).map((node) => node.id)).toEqual(["node-1"]);
+    expect(second.stateUpdate).toBeUndefined();
     expect(second.usage.totalTokens).toBe(0);
     expect(summarizer.requests).toHaveLength(1);
   });
@@ -189,7 +215,7 @@ describe("RuntimeContextManager", () => {
         recentTurns: 0,
         activeTurnRecentBlocks: 0,
         triggerRatio: 0.01,
-        targetRatio: 0.95,
+        targetRatio: 0.005,
         safetyMarginTokens: 32,
         segmentSourceTargetTokens: 120,
       },
@@ -204,9 +230,13 @@ describe("RuntimeContextManager", () => {
       signal: new AbortController().signal,
     });
 
-    expect(result.nodes.map((node) => node.level)).toEqual(["turn", "turn", "turn", "segment", "phase"]);
-    expect(result.nodes.at(-1)?.childNodeIds.length).toBeGreaterThan(0);
-    expect(result.frontierNodeIds).toEqual([result.nodes.at(-1)!.id]);
+    const nodes = nodesOf(result);
+    expect(nodes.filter((node) => node.level === "turn")).toHaveLength(3);
+    expect(nodes.map((node) => node.level)).toContain("segment");
+    expect(nodes.map((node) => node.level)).toContain("phase");
+    expect(nodes.map((node) => node.level)).toContain("session");
+    expect(nodes.filter((node) => node.level !== "turn").every((node) => node.childNodeIds.length > 0)).toBe(true);
+    expect(frontierOf(result)).toEqual([nodes.at(-1)!.id]);
   });
 
   test("records persisted source ids and phase ids when a source snapshot is provided", async () => {
@@ -223,16 +253,22 @@ describe("RuntimeContextManager", () => {
       policy: { recentTurns: 1, activeTurnRecentBlocks: 1, triggerRatio: 0.01, safetyMarginTokens: 32 },
       idFactory: () => "node-1",
       now: () => "2026-08-28T00:00:00.000Z",
-      sources: [
-        { messageId: "m-1", turnId: "t-1", turnIndex: 0, phaseId: "phase-a", sourceRevision: 12 },
-        { messageId: "m-2", turnId: "t-1", turnIndex: 0, phaseId: "phase-a", sourceRevision: 12 },
-        { messageId: "m-3", turnId: "t-2", turnIndex: 1, phaseId: "phase-a", sourceRevision: 12 },
-      ],
+    });
+    const sources = [
+      { messageId: "m-1", turnId: "t-1", turnIndex: 0, phaseId: "phase-a", sourceRevision: 12 },
+      { messageId: "m-2", turnId: "t-1", turnIndex: 0, phaseId: "phase-a", sourceRevision: 12 },
+      { messageId: "m-3", turnId: "t-2", turnIndex: 1, phaseId: "phase-a", sourceRevision: 12 },
+    ];
+
+    const result = await manager.prepare({
+      prompt: "Prompt",
+      messages,
+      model,
+      signal: new AbortController().signal,
+      sources,
     });
 
-    const result = await manager.prepare({ prompt: "Prompt", messages, model, signal: new AbortController().signal });
-
-    expect(result.nodes[0]).toMatchObject({
+    expect(nodesOf(result)[0]).toMatchObject({
       id: "node-1",
       phaseId: "phase-a",
       source: {
@@ -256,30 +292,32 @@ describe("RuntimeContextManager", () => {
         recentTurns: 1,
         activeTurnRecentBlocks: 1,
         triggerRatio: 0.01,
+        targetRatio: 0.005,
         safetyMarginTokens: 32,
         segmentSourceTargetTokens: 100,
       },
       idFactory: sequentialIds(),
       now: () => "2026-08-28T00:00:00.000Z",
-      sourceRevision: 20,
-      sources: phaseSources(10, 20),
     });
+    const sources = phaseSources(10, 20);
 
     const result = await manager.prepare({
       prompt: "Prompt",
       messages,
       model,
       signal: new AbortController().signal,
+      sources,
     });
 
-    const completedPhases = result.nodes.filter((node) => node.level === "phase" && !node.checkpoint);
-    const activeCheckpoint = result.nodes.find((node) => node.level === "phase" && node.checkpoint);
-    const sessionNode = result.nodes.find((node) => node.level === "session");
+    const nodes = nodesOf(result);
+    const completedPhases = nodes.filter((node) => node.level === "phase" && !node.checkpoint);
+    const activeCheckpoint = nodes.find((node) => node.level === "phase" && node.checkpoint);
+    const sessionNode = nodes.find((node) => node.level === "session");
     expect(completedPhases).toHaveLength(2);
     expect(activeCheckpoint).toMatchObject({ phaseId: "phase-c", checkpoint: true });
     expect(sessionNode?.childNodeIds).toEqual(completedPhases.map((node) => node.id));
     expect(sessionNode?.childNodeIds).not.toContain(activeCheckpoint?.id);
-    expect(result.frontierNodeIds).toEqual([sessionNode!.id, activeCheckpoint!.id]);
+    expect(frontierOf(result)).toEqual([sessionNode!.id, activeCheckpoint!.id]);
   });
 
   test("preserves the current User Message while checkpointing earlier current-turn blocks", async () => {
@@ -405,27 +443,32 @@ describe("RuntimeContextManager", () => {
     const model = new Model("test-model", provider, {}, { contextWindowTokens: 10000, maxOutputTokens: 64 });
     const messages = phaseTranscript(4);
     const activeSources = singlePhaseSources(4, 20, "active");
+    const activePhases = [
+      { id: "single-phase", status: "active" as const, startedTurnId: "single-turn-0" },
+    ];
     const active = new RuntimeContextManager({
       summarizer: new FixedSummarizer(),
       policy: {
         recentTurns: 1,
         activeTurnRecentBlocks: 1,
         triggerRatio: 0.01,
+        targetRatio: 0.005,
         safetyMarginTokens: 32,
         segmentSourceTargetTokens: 1,
       },
       idFactory: sequentialIds(),
-      sourceRevision: 20,
-      sources: activeSources,
+      restoreState: emptyRestoreState(20, activeSources, activePhases),
     });
     const activeResult = await active.prepare({
       prompt: "Prompt",
       messages,
       model,
       signal: new AbortController().signal,
+      sources: activeSources,
     });
-    const checkpoint = activeResult.nodes.find((node) => node.level === "phase" && node.checkpoint)!;
-    expect(activeResult.frontierNodeIds).toEqual([checkpoint.id]);
+    const activeNodes = nodesOf(activeResult);
+    const checkpoint = activeNodes.find((node) => node.level === "phase" && node.checkpoint)!;
+    expect(frontierOf(activeResult)).toEqual([checkpoint.id]);
 
     const resumedSummarizer = new FixedSummarizer();
     const resumed = new RuntimeContextManager({
@@ -434,49 +477,92 @@ describe("RuntimeContextManager", () => {
         recentTurns: 1,
         activeTurnRecentBlocks: 1,
         triggerRatio: 0.01,
+        targetRatio: 0.005,
         safetyMarginTokens: 32,
         segmentSourceTargetTokens: 1,
       },
-      initialNodes: active.snapshotNodes(),
-      initialFrontierNodeIds: activeResult.frontierNodeIds,
-      sourceRevision: 21,
-      sources: singlePhaseSources(4, 21, "active"),
+      restoreState: {
+        currentSourceRevision: 21,
+        sources: singlePhaseSources(4, 21, "active"),
+        phases: activePhases,
+        nodes: activeNodes,
+        checkpoint: activeResult.stateUpdate!.checkpoint,
+      },
     });
     const resumedResult = await resumed.prepare({
       prompt: "Prompt",
       messages,
       model,
       signal: new AbortController().signal,
+      canonicalAppendOnly: true,
     });
-    expect(resumedResult.nodes).toEqual([]);
-    expect(resumedResult.frontierNodeIds).toEqual([checkpoint.id]);
+    expect(resumedResult.path).toBe("incremental");
+    expect(resumedResult.stateUpdate).toBeUndefined();
     expect(resumedSummarizer.requests).toHaveLength(0);
 
+    const completedSources = [
+      ...singlePhaseSources(4, 22, "completed"),
+      {
+        messageId: "next-message",
+        turnId: "next-turn",
+        turnIndex: 4,
+        phaseId: "next-phase",
+        phaseStatus: "active" as const,
+        sourceRevision: 22,
+      },
+    ];
+    const completedPhases = [
+      {
+        id: "single-phase",
+        status: "completed" as const,
+        startedTurnId: "single-turn-0",
+        endedTurnId: "single-turn-3",
+      },
+      { id: "next-phase", status: "active" as const, startedTurnId: "next-turn" },
+    ];
+    const completedMessages = [
+      ...messages,
+      { role: "user", content: [{ type: "text", text: "start the next phase" }] } satisfies NonSystemMessage,
+    ];
+    const finalIds = ["final-turn", "final-phase", "final-session"];
     const completed = new RuntimeContextManager({
       summarizer: new FixedSummarizer(),
       policy: {
         recentTurns: 1,
         activeTurnRecentBlocks: 1,
         triggerRatio: 0.01,
+        targetRatio: 0.005,
         safetyMarginTokens: 32,
         segmentSourceTargetTokens: 1,
       },
-      idFactory: () => "final-phase",
-      initialNodes: active.snapshotNodes(),
-      initialFrontierNodeIds: activeResult.frontierNodeIds,
-      sourceRevision: 22,
-      sources: singlePhaseSources(4, 22, "completed"),
+      idFactory: () => finalIds.shift()!,
+      restoreState: {
+        currentSourceRevision: 22,
+        sources: completedSources,
+        phases: completedPhases,
+        nodes: activeNodes,
+        checkpoint: {
+          ...activeResult.stateUpdate!.checkpoint,
+          sourceRevision: 22,
+          frontierNodeIds: checkpoint.childNodeIds,
+          activePhaseId: "next-phase",
+        },
+      },
     });
     const completedResult = await completed.prepare({
       prompt: "Prompt",
-      messages,
+      messages: completedMessages,
       model,
       signal: new AbortController().signal,
+      sources: completedSources,
+      canonicalAppendOnly: true,
     });
 
-    expect(completedResult.nodes).toHaveLength(1);
-    expect(completedResult.nodes[0]).toMatchObject({ id: "final-phase", level: "phase", checkpoint: false });
-    expect(completedResult.frontierNodeIds).toEqual(["final-phase"]);
+    const finalPhase = nodesOf(completedResult).find(
+      (node) => node.level === "phase" && node.phaseId === "single-phase" && !node.checkpoint,
+    );
+    expect(finalPhase).toBeDefined();
+    expect(completedResult.messages.at(-1)).toEqual(completedMessages.at(-1));
   });
 
   test("reuses persisted source ids after the Session revision advances", async () => {
@@ -492,15 +578,15 @@ describe("RuntimeContextManager", () => {
       summarizer: new FixedSummarizer(),
       policy: { recentTurns: 1, activeTurnRecentBlocks: 1, triggerRatio: 0.01, safetyMarginTokens: 32 },
       idFactory: () => "node-1",
-      sourceRevision: 12,
-      sources: firstSources,
     });
     const firstResult = await first.prepare({
       prompt: "Prompt",
       messages,
       model,
       signal: new AbortController().signal,
+      sources: firstSources,
     });
+    const firstNodes = nodesOf(firstResult);
     const secondSummarizer = new FixedSummarizer();
     const second = new RuntimeContextManager({
       summarizer: secondSummarizer,
@@ -508,10 +594,13 @@ describe("RuntimeContextManager", () => {
       idFactory: () => {
         throw new Error("A compatible node should have been reused.");
       },
-      initialNodes: first.snapshotNodes(),
-      initialFrontierNodeIds: firstResult.frontierNodeIds,
-      sourceRevision: 13,
-      sources: stableSources(13),
+      restoreState: {
+        currentSourceRevision: 13,
+        sources: stableSources(13),
+        phases: [],
+        nodes: firstNodes,
+        checkpoint: firstResult.stateUpdate!.checkpoint,
+      },
     });
 
     const secondResult = await second.prepare({
@@ -519,11 +608,168 @@ describe("RuntimeContextManager", () => {
       messages,
       model,
       signal: new AbortController().signal,
+      canonicalAppendOnly: true,
     });
 
-    expect(secondResult.nodes).toEqual([]);
-    expect(secondResult.frontierNodeIds).toEqual(firstResult.frontierNodeIds);
+    expect(secondResult.path).toBe("incremental");
+    expect(secondResult.stateUpdate).toBeUndefined();
     expect(secondSummarizer.requests).toHaveLength(0);
+  });
+
+  test("restores a valid checkpoint through the incremental path without rebuilding stable history", async () => {
+    const { provider } = createScriptedProvider([]);
+    const model = new Model("test-model", provider, {}, { contextWindowTokens: 6400, maxOutputTokens: 64 });
+    const messages: NonSystemMessage[] = [
+      { role: "user", content: [{ type: "text", text: `old ${"x".repeat(500)}` }] },
+      { role: "assistant", content: [{ type: "text", text: `answer ${"y".repeat(400)}` }] },
+      { role: "user", content: [{ type: "text", text: "recent request" }] },
+      { role: "assistant", content: [{ type: "text", text: "recent answer" }] },
+    ];
+    const sources = messages.map((_, index) => ({
+      messageId: `message-${index}`,
+      turnId: `turn-${Math.floor(index / 2)}`,
+      turnIndex: Math.floor(index / 2),
+      sourceRevision: 12,
+    }));
+    const firstSummarizer = new FixedSummarizer();
+    const first = new RuntimeContextManager({
+      summarizer: firstSummarizer,
+      policy: { recentTurns: 1, activeTurnRecentBlocks: 2, triggerRatio: 0.01, safetyMarginTokens: 32 },
+      idFactory: () => "turn-node",
+    });
+    const firstResult = await first.prepare({
+      prompt: "Prompt",
+      messages,
+      model,
+      signal: new AbortController().signal,
+      sources,
+    });
+    expect(firstResult.path).toBe("rebuild");
+    expect(firstResult.stateUpdate).toBeDefined();
+
+    const secondSummarizer = new FixedSummarizer();
+    const second = new RuntimeContextManager({
+      summarizer: secondSummarizer,
+      policy: { recentTurns: 1, activeTurnRecentBlocks: 2, triggerRatio: 0.01, safetyMarginTokens: 32 },
+      restoreState: {
+        currentSourceRevision: 13,
+        sources,
+        phases: [],
+        nodes: nodesOf(firstResult),
+        checkpoint: firstResult.stateUpdate!.checkpoint,
+      },
+    });
+    const secondResult = await second.prepare({
+      prompt: "Prompt",
+      messages,
+      model,
+      signal: new AbortController().signal,
+      branchLineageId: "branch-1",
+      canonicalAppendOnly: true,
+    });
+
+    expect(secondResult.path).toBe("incremental");
+    expect(secondResult.stateUpdate).toBeUndefined();
+    expect(secondSummarizer.requests).toHaveLength(0);
+  });
+
+  test("summarizes the oldest required Raw Tail Turn only after the budget triggers", async () => {
+    const { provider } = createScriptedProvider([]);
+    const model = new Model("test-model", provider, {}, { contextWindowTokens: 10000, maxOutputTokens: 64 });
+    const initialMessages: NonSystemMessage[] = [
+      { role: "user", content: [{ type: "text", text: `old ${"x".repeat(500)}` }] },
+      { role: "assistant", content: [{ type: "text", text: `answer ${"y".repeat(400)}` }] },
+      { role: "user", content: [{ type: "text", text: "current" }] },
+      { role: "assistant", content: [{ type: "text", text: "current answer" }] },
+    ];
+    const initialSources = initialMessages.map((_, index) => ({
+      messageId: `message-${index}`,
+      turnId: `turn-${Math.floor(index / 2)}`,
+      turnIndex: Math.floor(index / 2),
+      sourceRevision: 12,
+    }));
+    const first = new RuntimeContextManager({
+      summarizer: new FixedSummarizer(),
+      policy: { recentTurns: 1, activeTurnRecentBlocks: 2, triggerRatio: 0.01, safetyMarginTokens: 32 },
+      idFactory: () => "old-node",
+    });
+    const firstResult = await first.prepare({
+      prompt: "Prompt",
+      messages: initialMessages,
+      model,
+      signal: new AbortController().signal,
+      sources: initialSources,
+    });
+    const expandedMessages = [
+      ...initialMessages,
+      { role: "user", content: [{ type: "text", text: "new turn" }] } satisfies NonSystemMessage,
+      { role: "assistant", content: [{ type: "text", text: `new answer ${"z".repeat(400)}` }] } satisfies NonSystemMessage,
+    ];
+    const expandedSources = [
+      ...initialSources,
+      { messageId: "message-4", turnId: "turn-2", turnIndex: 2, sourceRevision: 13 },
+      { messageId: "message-5", turnId: "turn-2", turnIndex: 2, sourceRevision: 13 },
+    ];
+    const summarizer = new FixedSummarizer();
+    const resumed = new RuntimeContextManager({
+      summarizer,
+      policy: { recentTurns: 1, activeTurnRecentBlocks: 2, triggerRatio: 0.01, safetyMarginTokens: 32 },
+      restoreState: {
+        currentSourceRevision: 13,
+        sources: initialSources,
+        phases: [],
+        nodes: nodesOf(firstResult),
+        checkpoint: firstResult.stateUpdate!.checkpoint,
+      },
+    });
+    const result = await resumed.prepare({
+      prompt: "Prompt",
+      messages: expandedMessages,
+      model,
+      signal: new AbortController().signal,
+      sources: expandedSources,
+      canonicalAppendOnly: true,
+    });
+
+    expect(result.path).toBe("incremental");
+    expect(result.compactedTurnCount).toBe(1);
+    expect(result.stateUpdate?.appendNodes).toHaveLength(1);
+    expect(summarizer.requests).toHaveLength(1);
+  });
+
+  test("extends the minimal Raw Tail prefix when actual summaries remain above the target budget", async () => {
+    const { provider } = createScriptedProvider([]);
+    const model = new Model("test-model", provider, {}, { contextWindowTokens: 1000, maxOutputTokens: 64 });
+    const messages: NonSystemMessage[] = [
+      { role: "user", content: [{ type: "text", text: "old request one" }] },
+      { role: "assistant", content: [{ type: "text", text: "old answer one" }] },
+      { role: "user", content: [{ type: "text", text: "old request two" }] },
+      { role: "assistant", content: [{ type: "text", text: "old answer two" }] },
+      { role: "user", content: [{ type: "text", text: "current request" }] },
+    ];
+    const manager = new RuntimeContextManager({
+      summarizer: new FixedSummarizer(),
+      estimator: new PredictableEstimator(120),
+      policy: {
+        recentTurns: 1,
+        activeTurnRecentBlocks: 1,
+        turnSummaryTargetTokens: 20,
+        triggerRatio: 0.45,
+        targetRatio: 0.35,
+        safetyMarginTokens: 32,
+      },
+      idFactory: sequentialIds(),
+    });
+
+    const result = await manager.prepare({
+      prompt: "Prompt",
+      messages,
+      model,
+      signal: new AbortController().signal,
+    });
+
+    expect(result.compactedTurnCount).toBe(2);
+    expect(result.estimatedTokens).toBeLessThanOrEqual(Math.floor((1000 - 64 - 32) * 0.35));
   });
 
   test("does not reuse nodes from a different summary schema", async () => {
@@ -538,19 +784,31 @@ describe("RuntimeContextManager", () => {
       summarizer: new FixedSummarizer(),
       policy: { recentTurns: 1, activeTurnRecentBlocks: 1, triggerRatio: 0.01, safetyMarginTokens: 32 },
       idFactory: () => "old-node",
-      sourceRevision: 12,
+    });
+    const seedResult = await seed.prepare({
+      prompt: "Prompt",
+      messages,
+      model,
+      signal: new AbortController().signal,
       sources: stableSources(12),
     });
-    await seed.prepare({ prompt: "Prompt", messages, model, signal: new AbortController().signal });
-    const incompatible = seed.snapshotNodes().map((node) => ({ ...node, summarySchemaVersion: 99 }));
+    const incompatible = nodesOf(seedResult).map((node) => ({ ...node, summarySchemaVersion: 99 }));
+    const incompatibleCheckpoint = {
+      ...seedResult.stateUpdate!.checkpoint,
+      summarySchemaVersion: 99,
+    };
     const summarizer = new FixedSummarizer();
     const manager = new RuntimeContextManager({
       summarizer,
       policy: { recentTurns: 1, activeTurnRecentBlocks: 1, triggerRatio: 0.01, safetyMarginTokens: 32 },
       idFactory: () => "new-node",
-      initialNodes: incompatible,
-      sourceRevision: 13,
-      sources: stableSources(13),
+      restoreState: {
+        currentSourceRevision: 13,
+        sources: stableSources(13),
+        phases: [],
+        nodes: incompatible,
+        checkpoint: incompatibleCheckpoint,
+      },
     });
 
     const result = await manager.prepare({
@@ -558,9 +816,12 @@ describe("RuntimeContextManager", () => {
       messages,
       model,
       signal: new AbortController().signal,
+      sources: stableSources(13),
+      canonicalAppendOnly: true,
     });
 
-    expect(result.nodes.map((node) => node.id)).toEqual(["new-node"]);
+    expect(result.path).toBe("rebuild");
+    expect(nodesOf(result).map((node) => node.id)).toEqual(["new-node"]);
     expect(summarizer.requests).toHaveLength(1);
   });
 
@@ -582,10 +843,14 @@ describe("RuntimeContextManager", () => {
         policyVersion: "context-v1",
       },
       idFactory: () => "old-node",
-      sourceRevision: 12,
+    });
+    const seedResult = await seed.prepare({
+      prompt: "Prompt",
+      messages,
+      model,
+      signal: new AbortController().signal,
       sources: stableSources(12),
     });
-    await seed.prepare({ prompt: "Prompt", messages, model, signal: new AbortController().signal });
     const summarizer = new FixedSummarizer();
     const manager = new RuntimeContextManager({
       summarizer,
@@ -597,9 +862,13 @@ describe("RuntimeContextManager", () => {
         policyVersion: "context-v2",
       },
       idFactory: () => "new-node",
-      initialNodes: seed.snapshotNodes(),
-      sourceRevision: 13,
-      sources: stableSources(13),
+      restoreState: {
+        currentSourceRevision: 13,
+        sources: stableSources(13),
+        phases: [],
+        nodes: nodesOf(seedResult),
+        checkpoint: seedResult.stateUpdate!.checkpoint,
+      },
     });
 
     const result = await manager.prepare({
@@ -607,10 +876,13 @@ describe("RuntimeContextManager", () => {
       messages,
       model,
       signal: new AbortController().signal,
+      sources: stableSources(13),
+      canonicalAppendOnly: true,
     });
 
-    expect(result.nodes.map((node) => node.id)).toEqual(["new-node"]);
-    expect(result.policyVersion).toBe("context-v2");
+    expect(result.path).toBe("rebuild");
+    expect(nodesOf(result).map((node) => node.id)).toEqual(["new-node"]);
+    expect(result.stateUpdate?.checkpoint.policyVersion).toBe("context-v2");
     expect(summarizer.requests).toHaveLength(1);
   });
 
@@ -626,20 +898,27 @@ describe("RuntimeContextManager", () => {
       summarizer: new FixedSummarizer(),
       policy: { recentTurns: 1, activeTurnRecentBlocks: 1, triggerRatio: 0.01, safetyMarginTokens: 32 },
       idFactory: () => "node-1",
-      sourceRevision: 12,
+    });
+    const seedResult = await seed.prepare({
+      prompt: "Prompt",
+      messages,
+      model,
+      signal: new AbortController().signal,
       sources: stableSources(12),
     });
-    await seed.prepare({ prompt: "Prompt", messages, model, signal: new AbortController().signal });
-    const commits: ContextManagerPrepareResult[] = [];
+    const commits = [] as NonNullable<ContextManagerPrepareResult["stateUpdate"]>[];
     const manager = new RuntimeContextManager({
       summarizer: new FixedSummarizer(),
       policy: { recentTurns: 1, activeTurnRecentBlocks: 1, triggerRatio: 0.01, safetyMarginTokens: 32 },
-      initialNodes: seed.snapshotNodes(),
-      initialFrontierNodeIds: [],
-      sourceRevision: 13,
-      sources: stableSources(13),
-      onCompaction: (result) => {
-        commits.push(result);
+      restoreState: {
+        currentSourceRevision: 13,
+        sources: stableSources(13),
+        phases: [],
+        nodes: nodesOf(seedResult),
+        checkpoint: { ...seedResult.stateUpdate!.checkpoint, sourceRevision: 13, frontierNodeIds: [] },
+      },
+      onStateUpdate: (update) => {
+        commits.push(update);
       },
     });
 
@@ -648,11 +927,336 @@ describe("RuntimeContextManager", () => {
       messages,
       model,
       signal: new AbortController().signal,
+      sources: stableSources(13),
+      canonicalAppendOnly: true,
     });
 
-    expect(result.nodes).toEqual([]);
+    expect(result.stateUpdate?.appendNodes).toEqual([]);
     expect(commits).toHaveLength(1);
-    expect(commits[0]?.frontierNodeIds).toEqual(["node-1"]);
+    expect(commits[0]?.checkpoint.frontierNodeIds).toEqual(["node-1"]);
+  });
+
+  test("retries uncommitted nodes after state persistence fails", async () => {
+    const { provider } = createScriptedProvider([]);
+    const model = new Model("test-model", provider, {}, { contextWindowTokens: 6400, maxOutputTokens: 64 });
+    const summarizer = new FixedSummarizer();
+    const attempted = [] as NonNullable<ContextManagerPrepareResult["stateUpdate"]>[];
+    let fail = true;
+    const manager = new RuntimeContextManager({
+      summarizer,
+      policy: { recentTurns: 1, activeTurnRecentBlocks: 1, triggerRatio: 0.01, safetyMarginTokens: 32 },
+      idFactory: sequentialIds(),
+      onStateUpdate: (update) => {
+        attempted.push(update);
+        if (fail) throw new Error("state write failed");
+      },
+    });
+    const input = {
+      prompt: "Prompt",
+      messages: longTranscript(),
+      model,
+      signal: new AbortController().signal,
+      branchLineageId: "branch-1",
+      canonicalAppendOnly: true,
+    };
+
+    await expect(manager.prepare(input)).rejects.toThrow("state write failed");
+    const requestCount = summarizer.requests.length;
+    fail = false;
+    const result = await manager.prepare(input);
+
+    expect(summarizer.requests).toHaveLength(requestCount);
+    expect(result.stateUpdate?.appendNodes.map((node) => node.id)).toEqual(
+      attempted[0]?.appendNodes.map((node) => node.id),
+    );
+    expect(attempted).toHaveLength(2);
+  });
+
+  test("rebuilds without reusing nodes when the Branch lineage changes", async () => {
+    const { provider } = createScriptedProvider([]);
+    const model = new Model("test-model", provider, {}, { contextWindowTokens: 6400, maxOutputTokens: 64 });
+    const summarizer = new FixedSummarizer();
+    const manager = new RuntimeContextManager({
+      summarizer,
+      policy: { recentTurns: 1, activeTurnRecentBlocks: 1, triggerRatio: 0.01, safetyMarginTokens: 32 },
+      idFactory: sequentialIds(),
+    });
+    const input = {
+      prompt: "Prompt",
+      messages: longTranscript(),
+      model,
+      signal: new AbortController().signal,
+      canonicalAppendOnly: true,
+    };
+    const first = await manager.prepare({ ...input, branchLineageId: "branch-1" });
+    const firstIds = new Set(nodesOf(first).map((node) => node.id));
+    const requestCount = summarizer.requests.length;
+
+    const second = await manager.prepare({ ...input, branchLineageId: "branch-2" });
+
+    expect(second.path).toBe("rebuild");
+    expect(nodesOf(second).every((node) => !firstIds.has(node.id))).toBe(true);
+    expect(summarizer.requests.length).toBeGreaterThan(requestCount);
+  });
+
+  test("does not persist summaries built from a non-canonical model message view", async () => {
+    const { provider } = createScriptedProvider([]);
+    const model = new Model("test-model", provider, {}, { contextWindowTokens: 6400, maxOutputTokens: 64 });
+    const commits = [] as NonNullable<ContextManagerPrepareResult["stateUpdate"]>[];
+    const summarizer = new FixedSummarizer();
+    const manager = new RuntimeContextManager({
+      summarizer,
+      policy: { recentTurns: 1, activeTurnRecentBlocks: 1, triggerRatio: 0.01, safetyMarginTokens: 32 },
+      onStateUpdate: (update) => {
+        commits.push(update);
+      },
+    });
+
+    const result = await manager.prepare({
+      prompt: "Prompt",
+      messages: longTranscript().slice(1),
+      model,
+      signal: new AbortController().signal,
+      canonicalAppendOnly: false,
+    });
+
+    expect(result.path).toBe("rebuild");
+    expect(result.stateUpdate).toBeUndefined();
+    expect(summarizer.requests.length).toBeGreaterThan(0);
+    expect(commits).toEqual([]);
+  });
+
+  test("keeps appended Turns raw when frontier plus Raw Tail stays below the trigger budget", async () => {
+    const { provider } = createScriptedProvider([]);
+    const compactModel = new Model("compact-model", provider, {}, { contextWindowTokens: 1200, maxOutputTokens: 64 });
+    const roomyModel = new Model("roomy-model", provider, {}, { contextWindowTokens: 50000, maxOutputTokens: 64 });
+    const initialMessages: NonSystemMessage[] = [
+      { role: "user", content: [{ type: "text", text: `old ${"x".repeat(900)}` }] },
+      { role: "assistant", content: [{ type: "text", text: `old answer ${"y".repeat(500)}` }] },
+      { role: "user", content: [{ type: "text", text: "current" }] },
+    ];
+    const initialSources = sourceMessages(initialMessages, 1);
+    const first = new RuntimeContextManager({
+      summarizer: new FixedSummarizer(),
+      policy: { recentTurns: 1, triggerRatio: 0.2, targetRatio: 0.1, safetyMarginTokens: 32 },
+      idFactory: sequentialIds(),
+    });
+    const firstResult = await first.prepare({
+      prompt: "Prompt",
+      messages: initialMessages,
+      model: compactModel,
+      signal: new AbortController().signal,
+      sources: initialSources,
+    });
+    expect(firstResult.stateUpdate).toBeDefined();
+
+    const appended = { role: "assistant", content: [{ type: "text", text: "new raw answer" }] } satisfies NonSystemMessage;
+    const messages = [...initialMessages, appended];
+    const sources = sourceMessages(messages, 2);
+    const summarizer = new FixedSummarizer();
+    const resumed = new RuntimeContextManager({
+      summarizer,
+      policy: { recentTurns: 1, triggerRatio: 0.2, targetRatio: 0.1, safetyMarginTokens: 32 },
+      restoreState: {
+        currentSourceRevision: 2,
+        sources,
+        phases: [],
+        nodes: nodesOf(firstResult),
+        checkpoint: firstResult.stateUpdate!.checkpoint,
+      },
+    });
+    const result = await resumed.prepare({
+      prompt: "Prompt",
+      messages,
+      model: roomyModel,
+      signal: new AbortController().signal,
+      sources,
+      canonicalAppendOnly: true,
+    });
+
+    expect(result.path).toBe("incremental");
+    expect(result.stateUpdate).toBeUndefined();
+    expect(result.messages.at(-1)).toEqual(appended);
+    expect(summarizer.requests).toHaveLength(0);
+  });
+
+  test("uses the incremental frontier even when unreachable old-policy nodes remain stored", async () => {
+    const { provider } = createScriptedProvider([]);
+    const model = new Model("test-model", provider, {}, { contextWindowTokens: 50000, maxOutputTokens: 64 });
+    const messages: NonSystemMessage[] = [
+      { role: "user", content: [{ type: "text", text: "old request" }] },
+      { role: "assistant", content: [{ type: "text", text: "old answer" }] },
+      { role: "user", content: [{ type: "text", text: "current request" }] },
+    ];
+    const sources = sourceMessages(messages, 3);
+    const validNode = turnNode("valid", sources, 0, 1, "context-v1");
+    const unreachable = { ...turnNode("unreachable", sources, 0, 1, "context-v0"), renderedText: "obsolete" };
+    const summarizer = new FixedSummarizer();
+    const manager = new RuntimeContextManager({
+      summarizer,
+      restoreState: restoreWithFrontier(3, sources, [validNode, unreachable], [validNode.id]),
+    });
+    const result = await manager.prepare({
+      prompt: "Prompt",
+      messages,
+      model,
+      signal: new AbortController().signal,
+      sources,
+      canonicalAppendOnly: true,
+    });
+
+    expect(result.path).toBe("incremental");
+    expect(result.stateUpdate).toBeUndefined();
+    expect(summarizer.requests).toHaveLength(0);
+  });
+
+  test("keeps incremental preparation bounded for a 10,000-message stable historical prefix", async () => {
+    const { provider } = createScriptedProvider([]);
+    const model = new Model("test-model", provider, {}, { contextWindowTokens: 100000, maxOutputTokens: 64 });
+    const messages: NonSystemMessage[] = [
+      { role: "user", content: [{ type: "text", text: "historical request" }] },
+      ...Array.from({ length: 9998 }, (_, index) => ({
+        role: "assistant" as const,
+        content: [{ type: "text" as const, text: `historical answer ${index}` }],
+      })),
+      { role: "user", content: [{ type: "text", text: "current request" }] },
+    ];
+    const sources = messages.map((_, index) => ({
+      messageId: `message-${index}`,
+      turnId: index < 9999 ? "historical-turn" : "current-turn",
+      turnIndex: index < 9999 ? 0 : 1,
+      sourceRevision: 4,
+    }));
+    const node = turnNode("historical", sources, 0, 9998, "context-v1");
+    const estimator = new CountingEstimator();
+    const manager = new RuntimeContextManager({
+      estimator,
+      restoreState: restoreWithFrontier(4, sources, [node], [node.id]),
+    });
+    const guardedSources = new Proxy(sources, {
+      get(target, property, receiver) {
+        if (property === Symbol.iterator) throw new Error("Fast path iterated the complete source snapshot");
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    estimator.messageCount = 0;
+    const result = await manager.prepare({
+      prompt: "Prompt",
+      messages,
+      model,
+      signal: new AbortController().signal,
+      sources: guardedSources,
+      canonicalAppendOnly: true,
+    });
+
+    expect(result.path).toBe("incremental");
+    expect(estimator.messageCount).toBeLessThan(20);
+  });
+
+  test("persists a new historical frontier when the same prepare also compacts the current Turn", async () => {
+    const { provider } = createScriptedProvider([]);
+    const model = new Model("test-model", provider, {}, { contextWindowTokens: 900, maxOutputTokens: 64 });
+    const messages: NonSystemMessage[] = [
+      { role: "user", content: [{ type: "text", text: `old ${"x".repeat(900)}` }] },
+      { role: "assistant", content: [{ type: "text", text: `old answer ${"y".repeat(500)}` }] },
+      { role: "user", content: [{ type: "text", text: "current request" }] },
+      toolUseMessage("call-1", "read_file"),
+      toolResultMessage("call-1", "a".repeat(900)),
+      toolUseMessage("call-2", "read_file"),
+      toolResultMessage("call-2", "b".repeat(900)),
+      toolUseMessage("call-3", "read_file"),
+      toolResultMessage("call-3", "c".repeat(900)),
+    ];
+    const sources = sourceMessages(messages, 5);
+    const commits = [] as NonNullable<ContextManagerPrepareResult["stateUpdate"]>[];
+    const summarizer = new FixedSummarizer();
+    const manager = new RuntimeContextManager({
+      summarizer,
+      policy: {
+        recentTurns: 1,
+        activeTurnRecentBlocks: 1,
+        triggerRatio: 0.2,
+        targetRatio: 0.1,
+        safetyMarginTokens: 32,
+      },
+      restoreState: emptyRestoreState(5, sources),
+      idFactory: sequentialIds(),
+      onStateUpdate: (update) => {
+        commits.push(update);
+      },
+    });
+    const first = await manager.prepare({
+      prompt: "Prompt",
+      messages,
+      model,
+      signal: new AbortController().signal,
+      sources,
+      branchLineageId: "branch-1",
+      canonicalAppendOnly: true,
+    });
+
+    expect(first.stateUpdate?.appendNodes.length).toBeGreaterThan(0);
+    expect(commits).toEqual([first.stateUpdate!]);
+    expect(summarizer.requests.some((request) => request.level === "turn_checkpoint")).toBe(true);
+    expect(first.messages.some((message) => JSON.stringify(message).includes("current request"))).toBe(true);
+
+    const expandedMessages = [
+      ...messages,
+      toolUseMessage("call-4", "read_file"),
+      toolResultMessage("call-4", "d".repeat(900)),
+    ];
+    const expandedSources = sourceMessages(expandedMessages, 6);
+    manager.updateSources(expandedSources, 6, [], first.stateUpdate!.checkpoint);
+    const previousCheckpointRequests = summarizer.requests.filter((request) => request.level === "turn_checkpoint").length;
+    const second = await manager.prepare({
+      prompt: "Prompt",
+      messages: expandedMessages,
+      model,
+      signal: new AbortController().signal,
+      sources: expandedSources,
+      branchLineageId: "branch-1",
+      canonicalAppendOnly: true,
+    });
+    const currentCheckpointRequests = summarizer.requests.filter((request) => request.level === "turn_checkpoint");
+
+    expect(second.path).toBe("incremental");
+    expect(currentCheckpointRequests).toHaveLength(previousCheckpointRequests + 1);
+    expect(currentCheckpointRequests.at(-1)?.sourceText).toContain("Context Summary: turn_checkpoint");
+    expect(currentCheckpointRequests.at(-1)?.sourceText).toContain("call-3");
+    expect(currentCheckpointRequests.at(-1)?.sourceText).not.toContain("call-1");
+  });
+
+  test("compresses the oldest protected historical Turn only when the hard input budget requires it", async () => {
+    const { provider } = createScriptedProvider([]);
+    const model = new Model("test-model", provider, {}, { contextWindowTokens: 650, maxOutputTokens: 64 });
+    const currentUser = { role: "user", content: [{ type: "text", text: "keep current raw" }] } satisfies NonSystemMessage;
+    const messages: NonSystemMessage[] = [
+      { role: "user", content: [{ type: "text", text: `one ${"x".repeat(700)}` }] },
+      { role: "assistant", content: [{ type: "text", text: `one answer ${"y".repeat(300)}` }] },
+      { role: "user", content: [{ type: "text", text: `two ${"x".repeat(700)}` }] },
+      { role: "assistant", content: [{ type: "text", text: `two answer ${"y".repeat(300)}` }] },
+      currentUser,
+    ];
+    const manager = new RuntimeContextManager({
+      summarizer: new FixedSummarizer(),
+      policy: {
+        recentTurns: 3,
+        activeTurnRecentBlocks: 3,
+        triggerRatio: 0.5,
+        targetRatio: 0.3,
+        safetyMarginTokens: 32,
+      },
+      idFactory: sequentialIds(),
+    });
+    const result = await manager.prepare({
+      prompt: "Prompt",
+      messages,
+      model,
+      signal: new AbortController().signal,
+    });
+
+    expect(result.compactedTurnCount).toBeGreaterThan(0);
+    expect(result.messages.at(-1)).toEqual(currentUser);
   });
 
   test("stops before the main model call when summary usage exceeds the execution tree budget", async () => {
@@ -680,6 +1284,116 @@ describe("RuntimeContextManager", () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+function nodesOf(result: ContextManagerPrepareResult) {
+  return result.stateUpdate?.appendNodes ?? [];
+}
+
+function frontierOf(result: ContextManagerPrepareResult) {
+  return result.stateUpdate?.checkpoint.frontierNodeIds ?? [];
+}
+
+function emptyRestoreState(
+  sourceRevision: number,
+  sources: ContextSourceMessage[],
+  phases: ContextPhaseState[] = [],
+): ContextRestoreState {
+  return {
+    currentSourceRevision: sourceRevision,
+    sources,
+    phases,
+    nodes: [],
+    checkpoint: {
+      sourceRevision,
+      frontierNodeIds: [],
+      activePhaseId: phases.find((phase) => phase.status === "active")?.id ?? null,
+      nextPhaseObjective: null,
+      policyVersion: "context-v1",
+      summarySchemaVersion: 1,
+      updatedAt: "2026-08-28T00:00:00.000Z",
+    },
+  };
+}
+
+function restoreWithFrontier(
+  sourceRevision: number,
+  sources: ContextSourceMessage[],
+  nodes: CompactionNode[],
+  frontierNodeIds: string[],
+): ContextRestoreState {
+  return {
+    currentSourceRevision: sourceRevision,
+    sources,
+    phases: [],
+    nodes,
+    checkpoint: {
+      sourceRevision,
+      frontierNodeIds,
+      activePhaseId: null,
+      nextPhaseObjective: null,
+      policyVersion: "context-v1",
+      summarySchemaVersion: 1,
+      updatedAt: "2026-08-28T00:00:00.000Z",
+    },
+  };
+}
+
+function turnNode(
+  id: string,
+  sources: ContextSourceMessage[],
+  firstMessageIndex: number,
+  lastMessageIndex: number,
+  policyVersion: string,
+): CompactionNode {
+  const first = sources[firstMessageIndex]!;
+  const last = sources[lastMessageIndex]!;
+  return {
+    id,
+    level: "turn",
+    checkpoint: false,
+    source: {
+      firstMessageIndex,
+      lastMessageIndex,
+      firstTurnIndex: first.turnIndex,
+      lastTurnIndex: last.turnIndex,
+      firstMessageId: first.messageId,
+      lastMessageId: last.messageId,
+      firstTurnId: first.turnId,
+      lastTurnId: last.turnId,
+      sourceRevision: first.sourceRevision,
+    },
+    childNodeIds: [],
+    summary: {
+      objectives: [],
+      constraints: [],
+      decisions: [],
+      progress: [],
+      results: [],
+      artifacts: [],
+      pending: [],
+    },
+    renderedText: `Context Summary: ${id}`,
+    estimatedTokens: 16,
+    summarySchemaVersion: 1,
+    policyVersion,
+    generatedBy: { model: "test-model" },
+    generationUsage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+    createdAt: "2026-08-28T00:00:00.000Z",
+  };
+}
+
+function sourceMessages(messages: NonSystemMessage[], sourceRevision: number): ContextSourceMessage[] {
+  let turnIndex = -1;
+  return messages.map((message, messageIndex) => {
+    if (message.role === "user") turnIndex++;
+    return {
+      messageId: `source-${messageIndex}`,
+      turnId: `source-turn-${Math.max(0, turnIndex)}`,
+      turnIndex: Math.max(0, turnIndex),
+      sourceRevision,
+    };
+  });
+}
 
 function longTranscript(): NonSystemMessage[] {
   const messages: NonSystemMessage[] = [];

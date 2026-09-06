@@ -6,22 +6,25 @@ import type { ContextMessageBlock } from "./types";
 export function buildMessageBlocks(
   messages: readonly NonSystemMessage[],
   estimator = new TokenEstimator(),
+  range?: { start: number; end: number },
 ): ContextMessageBlock[] {
+  const offset = range?.start ?? 0;
+  const input = range ? messages.slice(range.start, range.end) : messages;
   const blocks: ContextMessageBlock[] = [];
   let turnIndex = -1;
   let index = 0;
-  while (index < messages.length) {
-    const message = messages[index]!;
+  while (index < input.length) {
+    const message = input[index]!;
     if (message.role === "user") {
       turnIndex++;
-      blocks.push(block(index, index, [message], turnIndex, false, estimator));
+      blocks.push(block(index + offset, index + offset, [message], turnIndex, false, estimator));
       index++;
       continue;
     }
     if (message.role === "assistant") {
       const toolUses = message.content.filter((content): content is ToolUseContent => content.type === "tool_use");
       if (toolUses.length === 0) {
-        blocks.push(block(index, index, [message], Math.max(turnIndex, 0), false, estimator));
+        blocks.push(block(index + offset, index + offset, [message], Math.max(turnIndex, 0), false, estimator));
         index++;
         continue;
       }
@@ -30,8 +33,8 @@ export function buildMessageBlocks(
       let end = index;
       let seen = 0;
       let scan = index + 1;
-      while (scan < messages.length && seen < ids.size) {
-        const candidate = messages[scan]!;
+      while (scan < input.length && seen < ids.size) {
+        const candidate = input[scan]!;
         if (candidate.role !== "tool") break;
         const matched = candidate.content.some((content) => ids.has(content.tool_use_id));
         if (!matched) break;
@@ -40,11 +43,13 @@ export function buildMessageBlocks(
         end = scan;
         scan++;
       }
-      blocks.push(block(index, end, blockMessages, Math.max(turnIndex, 0), seen < ids.size, estimator));
+      blocks.push(
+        block(index + offset, end + offset, blockMessages, Math.max(turnIndex, 0), seen < ids.size, estimator),
+      );
       index = end + 1;
       continue;
     }
-    blocks.push(block(index, index, [message], Math.max(turnIndex, 0), true, estimator));
+    blocks.push(block(index + offset, index + offset, [message], Math.max(turnIndex, 0), true, estimator));
     index++;
   }
   return blocks;

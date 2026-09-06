@@ -22,7 +22,15 @@ import {
   textFromAssistant,
 } from "@/runtime/execution/agent-execution";
 import type { AgentRun } from "@/runtime/execution/agent-run";
-import type { AgentId, AgentRunOptions, DelegateDefinition, ExecutionBranchResult, ExecutionResult, HandoffDefinition } from "@/runtime/execution/types";
+import {
+  type AgentId,
+  type AgentRunOptions,
+  type DelegateDefinition,
+  ExecutionCheckpointError,
+  type ExecutionBranchResult,
+  type ExecutionResult,
+  type HandoffDefinition,
+} from "@/runtime/execution/types";
 import type {
   AfterHandoffParams,
   AgentMiddleware,
@@ -239,9 +247,11 @@ export class Agent {
           return;
         }
 
-        await this._act(execution, toolUses);
+        await this._runtime.checkpoint(execution, { reason: "tool_call", messages: [assistantMessage] });
+        const toolMessages = await this._act(execution, toolUses);
         if (execution.status === "handed_off") return;
         await this._afterAgentStep(step);
+        await this._runtime.checkpoint(execution, { reason: "step_completed", messages: toolMessages });
       }
       execution.limit(executionError("MAX_STEPS_EXCEEDED", "Maximum number of steps reached"));
     } catch (error) {
@@ -251,7 +261,9 @@ export class Agent {
         return;
       }
       const messageText = error instanceof Error ? error.message : String(error);
-      execution.fail(executionError("MODEL_FAILED", messageText));
+      execution.fail(
+        executionError(error instanceof ExecutionCheckpointError ? "CHECKPOINT_FAILED" : "MODEL_FAILED", messageText),
+      );
     }
   }
 
@@ -373,11 +385,11 @@ export class Agent {
     };
   }
 
-  private async _act(execution: AgentExecution, toolUses: ToolUseContent[]): Promise<void> {
+  private async _act(execution: AgentExecution, toolUses: ToolUseContent[]): Promise<ToolMessage[]> {
     const signal = execution.signal;
     const handoffUses = toolUses.filter((toolUse) => this._isHandoffToolName(toolUse.name));
     if (handoffUses.length > 0 && toolUses.length !== 1) {
-      await this._appendToolResults(
+      return this._appendToolResults(
         execution,
         toolUses.map((toolUse, index) => ({
           index,
@@ -391,7 +403,6 @@ export class Agent {
           },
         })),
       );
-      return;
     }
     let ordinaryToolCount = toolUses.filter((toolUse) => toolUse.name !== "delegate_task").length;
     let resolveOrdinaryTools!: () => void;
@@ -435,6 +446,7 @@ export class Agent {
         });
         return { index, toolUseId: toolUse.id, toolName: toolUse.name, result: record.outcome };
       } catch (error) {
+        if (error instanceof ExecutionCheckpointError) throw error;
         const message = error instanceof Error ? error.message : String(error);
         return { index, toolUseId: toolUse.id, toolName: toolUse.name, result: `Error: ${message}` };
       } finally {
@@ -453,24 +465,27 @@ export class Agent {
       : null;
 
     const remaining = new Set(pending.map((_, i) => i));
+    const toolMessages: ToolMessage[] = [];
     while (remaining.size > 0) {
       const candidates = [...remaining].map((i) => pending[i]);
       const resolved = (await (abortPromise ? Promise.race([...candidates, abortPromise]) : Promise.race(candidates)))!;
       remaining.delete(resolved.index);
       if (execution.terminal) {
-        return;
+        return toolMessages;
       }
 
-      await this._appendToolResults(execution, [resolved]);
+      toolMessages.push(...(await this._appendToolResults(execution, [resolved])));
     }
+    return toolMessages;
   }
 
   private async _appendToolResults(
     execution: AgentExecution,
     results: Array<{ toolUseId: string; toolName: string; result: unknown }>,
-  ) {
+  ): Promise<ToolMessage[]> {
+    const messages: ToolMessage[] = [];
     for (const resolved of results) {
-      if (execution.terminal) return;
+      if (execution.terminal) return messages;
       const toolMessage: ToolMessage = {
         role: "tool",
         content: [
@@ -484,7 +499,9 @@ export class Agent {
       this._appendMessage(toolMessage);
       execution.appendMessage(toolMessage);
       execution.emitAgentEvent({ type: "message", message: toolMessage });
+      messages.push(toolMessage);
     }
+    return messages;
   }
 
   private _effectiveTools(execution: AgentExecution, options: { beforeDelegationWait?: Promise<void> } = {}): Tool[] {
@@ -549,6 +566,8 @@ export class Agent {
         tools: modelContext.tools,
         model: this.model,
         signal: execution.signal,
+        branchLineageId: execution.branchId,
+        canonicalAppendOnly: modelContext.messages === this.messages,
       });
       modelContext.messages = prepared.messages;
       execution.noteTokenUsage(prepared.usage);
@@ -560,7 +579,13 @@ export class Agent {
         type: "context",
         status: "completed",
         resultTokens: prepared.estimatedTokens,
-        nodeIds: prepared.nodes.map((node) => node.id),
+        nodeIds: prepared.stateUpdate?.appendNodes.map((node) => node.id) ?? [],
+        ...(prepared.path ? { path: prepared.path } : {}),
+        ...(prepared.reusedNodeCount !== undefined ? { reusedNodeCount: prepared.reusedNodeCount } : {}),
+        ...(prepared.createdNodeCount !== undefined ? { createdNodeCount: prepared.createdNodeCount } : {}),
+        ...(prepared.compactedTurnCount !== undefined
+          ? { compactedTurnCount: prepared.compactedTurnCount }
+          : {}),
       });
     } catch (error) {
       const info =

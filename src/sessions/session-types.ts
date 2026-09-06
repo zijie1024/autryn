@@ -1,5 +1,5 @@
 import type { ExecutionMode, NonSystemMessage } from "@/core";
-import type { CompactionNode } from "@/runtime/context";
+import type { CompactionNode, ContextCompactionCheckpoint, ContextStateUpdate } from "@/runtime/context";
 import type { DryRunReport, HandoffRecord } from "@/runtime/execution/types";
 
 import type { SessionErrorCode } from "./errors";
@@ -105,23 +105,14 @@ export interface PersistedPhase {
   completedAt?: string;
 }
 
-export interface ContextCompactionCheckpoint {
-  sourceRevision: number;
-  frontierNodeIds: string[];
-  recentStartTurnId?: string;
-  activePhaseId?: string;
-  nextPhaseObjective?: string;
-  policyVersion: string;
-  summarySchemaVersion: number;
-  updatedAt: string;
-}
-
 export interface SessionCompactionState {
   version: 1;
   phases: PersistedPhase[];
   nodes: CompactionNode[];
   checkpoint: ContextCompactionCheckpoint;
 }
+
+export type { ContextCompactionCheckpoint, ContextStateUpdate };
 
 export interface SessionSummary {
   id: SessionId;
@@ -161,13 +152,14 @@ export interface PublicMaintenanceWarning {
 export interface SessionStore {
   list(options?: { projectKey?: string; includeAllProjects?: boolean }): Promise<SessionSummary[]>;
   load(id: SessionId): Promise<SessionRecord>;
+  create(record: SessionRecord): Promise<SessionRecord>;
+  mutate(
+    id: SessionId,
+    reducer: (current: SessionRecord) => SessionRecord | null,
+    options?: { operation?: "commit" | "clear" },
+  ): Promise<SessionRecord>;
   acquire(id: SessionId, options?: { create?: boolean; force?: boolean }): Promise<SessionLease>;
-  commit(lease: SessionLease, expectedRevision: number, next: SessionRecord): Promise<CommitOutcome>;
-  delete(lease: SessionLease, id: SessionId): Promise<void>;
-}
-
-export interface DurableClearSessionStore extends SessionStore {
-  commitClear(lease: SessionLease, expectedRevision: number, next: SessionRecord): Promise<CommitOutcome>;
+  deleteSession(id: SessionId): Promise<void>;
 }
 
 export interface Clock {

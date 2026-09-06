@@ -1,10 +1,12 @@
 import { SessionError } from "./errors";
+import { SessionMutationQueue } from "./session-mutation-queue";
 import { assertSessionRecord, displaySessionName, shortSessionId } from "./session-schema";
 import type { CommitOutcome, SessionLease, SessionRecord, SessionStore, SessionSummary } from "./session-types";
 
 export class MemorySessionStore implements SessionStore {
   private readonly records = new Map<string, SessionRecord>();
   private readonly locks = new Map<string, { ownerId: string; refs: number; lease: SessionLease }>();
+  private readonly mutationQueue = new SessionMutationQueue();
 
   constructor(records: SessionRecord[] = []) {
     for (const record of records) {
@@ -28,6 +30,40 @@ export class MemorySessionStore implements SessionStore {
     const record = this.records.get(id);
     if (!record) throw new SessionError("SESSION_NOT_FOUND", `Session ${id} was not found.`);
     return structuredClone(record);
+  }
+
+  async create(record: SessionRecord): Promise<SessionRecord> {
+    return this.mutationQueue.run(record.id, async () => {
+      const lease = await this.acquire(record.id, { create: true });
+      try {
+        await this.commit(lease, 0, record);
+        return structuredClone(record);
+      } finally {
+        await lease.release();
+      }
+    });
+  }
+
+  async mutate(
+    id: string,
+    reducer: (current: SessionRecord) => SessionRecord | null,
+    options: { operation?: "commit" | "clear" } = {},
+  ): Promise<SessionRecord> {
+    return this.mutationQueue.run(id, async () => {
+      const lease = await this.acquire(id);
+      try {
+        const current = await this.load(id);
+        const next = reducer(current);
+        if (next === null) return current;
+        if (options.operation === "clear" && next.messages.length !== 0) {
+          throw new SessionError("INVALID_SESSION_RECORD", "Clear commits must persist an empty transcript.");
+        }
+        await this.commit(lease, current.revision, next);
+        return next;
+      } finally {
+        await lease.release();
+      }
+    });
   }
 
   async acquire(id: string, options: { create?: boolean } = {}): Promise<SessionLease> {
@@ -58,7 +94,7 @@ export class MemorySessionStore implements SessionStore {
     return lease;
   }
 
-  async commit(lease: SessionLease, expectedRevision: number, next: SessionRecord): Promise<CommitOutcome> {
+  private async commit(lease: SessionLease, expectedRevision: number, next: SessionRecord): Promise<CommitOutcome> {
     this.assertLease(lease);
     const current = this.records.get(lease.sessionId);
     const currentRevision = current?.revision ?? 0;
@@ -80,13 +116,24 @@ export class MemorySessionStore implements SessionStore {
     return { committed: true, revision: validated.revision, warnings: [] };
   }
 
-  async delete(lease: SessionLease, id: string): Promise<void> {
+  private async delete(lease: SessionLease, id: string): Promise<void> {
     this.assertLease(lease);
     if (lease.sessionId !== id) {
       throw new SessionError("INVALID_SESSION_ID", "Lease does not target the requested session.");
     }
     this.records.delete(id);
     this.locks.delete(id);
+  }
+
+  async deleteSession(id: string): Promise<void> {
+    await this.mutationQueue.run(id, async () => {
+      const lease = await this.acquire(id);
+      try {
+        await this.delete(lease, id);
+      } finally {
+        await lease.release().catch(() => {});
+      }
+    });
   }
 
   private assertLease(lease: SessionLease) {

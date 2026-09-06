@@ -92,6 +92,77 @@ describe("Agent loop", () => {
     expect(agent.streaming).toBe(false);
   });
 
+  test("awaits execution checkpoints before continuing a Tool step", async () => {
+    const { provider } = createScriptedProvider([
+      () => [finalToolUseMessage([{ id: "checkpoint_call", name: "echo_tool", input: { text: "checkpoint" } }])],
+      () => [finalTextMessage("done")],
+    ]);
+    let releaseCheckpoint!: () => void;
+    const checkpointGate = new Promise<void>((resolve) => {
+      releaseCheckpoint = resolve;
+    });
+    let toolInvoked = false;
+    const tool = defineTool({
+      ...echoTool(),
+      execute: async ({ text }) => {
+        toolInvoked = true;
+        return `echo: ${text}`;
+      },
+    });
+    const checkpoints: string[] = [];
+    const agent = new Agent({ name: "t", model: new Model("m", provider), prompt: "p", tools: [tool] });
+
+    const run = agent.execute(userMessage, {
+      onCheckpoint: async (checkpoint) => {
+        checkpoints.push(checkpoint.reason);
+        if (checkpoint.reason === "tool_call") await checkpointGate;
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(toolInvoked).toBe(false);
+    releaseCheckpoint();
+    await run.result;
+
+    expect(toolInvoked).toBe(true);
+    expect(checkpoints).toEqual(["tool_call", "step_completed"]);
+  });
+
+  test("fails the execution when a checkpoint cannot be persisted", async () => {
+    let invoked = false;
+    const provider = createScriptedProvider([
+      () => [finalToolUseMessage([{ id: "tool-1", name: "write", input: {} }])],
+      () => [finalTextMessage("should not run")],
+    ]);
+    const agent = new Agent({
+      model: new Model("test-model", provider.provider),
+      prompt: "test",
+      tools: [
+        {
+          name: "write",
+          description: "write",
+          effect: { kind: "mutation", scope: "process", description: "Write test data." },
+          parameters: z.object({}),
+          execute: async () => {
+            invoked = true;
+            return "written";
+          },
+        },
+      ],
+    });
+
+    const run = agent.execute({ role: "user", content: [{ type: "text", text: "run" }] }, {
+      onCheckpoint: async () => {
+        throw new Error("session store unavailable");
+      },
+    });
+    const result = await run.result;
+
+    expect(result.status).toBe("failed");
+    expect(result.error?.code).toBe("CHECKPOINT_FAILED");
+    expect(result.error?.message).toContain("Execution checkpoint failed: session store unavailable");
+    expect(invoked).toBe(false);
+  });
+
   test("tool not found becomes an error observation the loop can continue from", async () => {
     const { provider, calls } = createScriptedProvider([
       () => [finalToolUseMessage([{ id: "call_ghost", name: "ghost_tool", input: {} }])],

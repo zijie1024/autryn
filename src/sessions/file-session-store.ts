@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { SessionError } from "./errors";
+import { SessionMutationQueue } from "./session-mutation-queue";
 import {
   ensureSessionsRoot,
   isPathInside,
@@ -12,10 +13,9 @@ import {
   revisionFilename,
   sessionDirectory,
 } from "./session-paths";
-import { displaySessionName, parseSessionRecord, shortSessionId } from "./session-schema";
+import { assertSessionRecord, displaySessionName, parseSessionRecord, shortSessionId } from "./session-schema";
 import type {
   CommitOutcome,
-  DurableClearSessionStore,
   PublicMaintenanceWarning,
   SessionHealth,
   SessionLease,
@@ -38,6 +38,7 @@ interface FileSessionStoreOptions {
 interface FileSessionLease extends SessionLease {
   dir: string;
   leasePath: string;
+  fileTail: Promise<void>;
   heartbeatTimer: ReturnType<typeof setInterval> | null;
   heartbeatTask: Promise<void> | null;
   released: boolean;
@@ -57,7 +58,7 @@ interface LeasePayload {
   heartbeatAt: string;
 }
 
-export class FileSessionStore implements SessionStore, DurableClearSessionStore {
+export class FileSessionStore implements SessionStore {
   private readonly home?: string;
   private readonly explicitRoot?: string;
   private readonly ownerId: string;
@@ -65,6 +66,7 @@ export class FileSessionStore implements SessionStore, DurableClearSessionStore 
   private readonly heartbeatIntervalMs: number;
   private readonly processAlive: (pid: number, hostname: string) => boolean | Promise<boolean>;
   private readonly heldLeases = new Map<string, HeldLease>();
+  private readonly mutationQueue = new SessionMutationQueue();
 
   constructor(options: FileSessionStoreOptions = {}) {
     this.home = options.home;
@@ -116,6 +118,42 @@ export class FileSessionStore implements SessionStore, DurableClearSessionStore 
     return loaded.record;
   }
 
+  async create(record: SessionRecord): Promise<SessionRecord> {
+    const validated = assertSessionRecord(record);
+    return this.mutationQueue.run(validated.id, async () => {
+      const lease = await this.acquire(validated.id, { create: true });
+      try {
+        await this.commit(lease, 0, validated);
+        return validated;
+      } finally {
+        await lease.release();
+      }
+    });
+  }
+
+  async mutate(
+    id: string,
+    reducer: (current: SessionRecord) => SessionRecord | null,
+    options: { operation?: "commit" | "clear" } = {},
+  ): Promise<SessionRecord> {
+    return this.mutationQueue.run(id, async () => {
+      const lease = await this.acquire(id);
+      try {
+        const current = await this.load(id);
+        const next = reducer(current);
+        if (next === null) return current;
+        if (options.operation === "clear") {
+          await this.commitClear(lease, current.revision, next);
+        } else {
+          await this.commit(lease, current.revision, next);
+        }
+        return next;
+      } finally {
+        await lease.release();
+      }
+    });
+  }
+
   async acquire(id: string, options: { create?: boolean; force?: boolean } = {}): Promise<SessionLease> {
     const root = await this.root();
     const sessionId = normalizeSessionId(id);
@@ -153,7 +191,7 @@ export class FileSessionStore implements SessionStore, DurableClearSessionStore 
       startedAt: this.now(),
       heartbeatAt: this.now(),
     };
-    await this.writeNewLease(leasePath, leasePayload, options.force ?? false);
+    await this.writeNewLease(leasePath, leasePayload);
 
     const lease: FileSessionLease = {
       sessionId,
@@ -161,6 +199,7 @@ export class FileSessionStore implements SessionStore, DurableClearSessionStore 
       revision: current.ok ? current.record.revision : 0,
       dir,
       leasePath,
+      fileTail: Promise.resolve(),
       heartbeatTimer: null,
       heartbeatTask: null,
       released: false,
@@ -173,23 +212,32 @@ export class FileSessionStore implements SessionStore, DurableClearSessionStore 
     return lease;
   }
 
-  async commit(lease: SessionLease, expectedRevision: number, next: SessionRecord): Promise<CommitOutcome> {
+  private async commit(lease: SessionLease, expectedRevision: number, next: SessionRecord): Promise<CommitOutcome> {
     const fileLease = this.asFileLease(lease);
-    await this.commitRevision(fileLease, expectedRevision, next);
-    const warnings = await this.cleanupOldRevisions(fileLease.dir, next.revision);
-    return { committed: true, revision: next.revision, warnings };
+    return this.withLeaseFileOperation(fileLease, async () => {
+      await this.commitRevision(fileLease, expectedRevision, next);
+      const warnings = await this.cleanupOldRevisions(fileLease.dir, next.revision);
+      return { committed: true, revision: next.revision, warnings };
+    });
   }
 
-  async commitClear(lease: SessionLease, expectedRevision: number, next: SessionRecord): Promise<CommitOutcome> {
+  private async commitClear(
+    lease: SessionLease,
+    expectedRevision: number,
+    next: SessionRecord,
+  ): Promise<CommitOutcome> {
     const fileLease = this.asFileLease(lease);
-    if (next.messages.length !== 0) {
-      throw new SessionError("INVALID_SESSION_RECORD", "Clear commits must persist an empty transcript.");
-    }
-    await this.writeClearIntent(fileLease, expectedRevision + 1, next);
-    await this.commitRevision(fileLease, expectedRevision, next);
-    const warnings = await this.cleanupAfterClear(fileLease.dir, next.revision);
-    await unlink(path.join(fileLease.dir, "clear.intent")).catch(() => {});
-    return { committed: true, revision: next.revision, warnings };
+    return this.withLeaseFileOperation(fileLease, async () => {
+      const validated = assertSessionRecord(next);
+      if (validated.messages.length !== 0) {
+        throw new SessionError("INVALID_SESSION_RECORD", "Clear commits must persist an empty transcript.");
+      }
+      await this.writeClearIntent(fileLease, expectedRevision + 1, validated);
+      await this.commitRevision(fileLease, expectedRevision, validated);
+      const warnings = await this.cleanupAfterClear(fileLease.dir, validated.revision);
+      await unlink(path.join(fileLease.dir, "clear.intent")).catch(() => {});
+      return { committed: true, revision: validated.revision, warnings };
+    });
   }
 
   private async commitRevision(
@@ -209,10 +257,14 @@ export class FileSessionStore implements SessionStore, DurableClearSessionStore 
     if (next.id !== fileLease.sessionId || next.revision !== expectedRevision + 1) {
       throw new SessionError("INVALID_SESSION_RECORD", "Committed record id/revision does not match the lease.");
     }
+    const validated = assertSessionRecord(next);
 
-    const target = path.join(fileLease.dir, revisionFilename(next.revision));
-    const tmp = path.join(fileLease.dir, `.${next.revision.toString().padStart(16, "0")}.${crypto.randomUUID()}.tmp`);
-    const content = `${JSON.stringify(next, stableJsonReplacer, 2)}\n`;
+    const target = path.join(fileLease.dir, revisionFilename(validated.revision));
+    const tmp = path.join(
+      fileLease.dir,
+      `.${validated.revision.toString().padStart(16, "0")}.${crypto.randomUUID()}.tmp`,
+    );
+    const content = `${JSON.stringify(validated, stableJsonReplacer, 2)}\n`;
     const handle = await open(tmp, "wx", 0o600);
     try {
       await handle.writeFile(content, "utf8");
@@ -221,24 +273,37 @@ export class FileSessionStore implements SessionStore, DurableClearSessionStore 
       await handle.close();
     }
     await rename(tmp, target);
-    const verified = await this.readRevision(target, fileLease.sessionId, next.revision);
-    if (verified.revision !== next.revision) {
+    const verified = await this.readRevision(target, fileLease.sessionId, validated.revision);
+    if (verified.revision !== validated.revision) {
       throw new SessionError("SESSION_SAVE_FAILED", "Committed session revision could not be verified.");
     }
-    fileLease.revision = next.revision;
+    fileLease.revision = validated.revision;
   }
 
-  async delete(lease: SessionLease, id: string): Promise<void> {
+  private async delete(lease: SessionLease, id: string): Promise<void> {
     const fileLease = this.asFileLease(lease);
-    await this.assertLease(fileLease);
-    const sessionId = normalizeSessionId(id);
-    if (sessionId !== fileLease.sessionId) {
-      throw new SessionError("INVALID_SESSION_ID", "Lease does not target the requested session.");
-    }
-    const root = await this.root();
-    const deleting = path.join(root, `.deleting-${sessionId}-${crypto.randomUUID()}`);
-    await rename(fileLease.dir, deleting);
-    await rm(deleting, { recursive: true, force: true });
+    await this.withLeaseFileOperation(fileLease, async () => {
+      await this.assertLease(fileLease);
+      const sessionId = normalizeSessionId(id);
+      if (sessionId !== fileLease.sessionId) {
+        throw new SessionError("INVALID_SESSION_ID", "Lease does not target the requested session.");
+      }
+      const root = await this.root();
+      const deleting = path.join(root, `.deleting-${sessionId}-${crypto.randomUUID()}`);
+      await rename(fileLease.dir, deleting);
+      await rm(deleting, { recursive: true, force: true });
+    });
+  }
+
+  async deleteSession(id: string): Promise<void> {
+    await this.mutationQueue.run(id, async () => {
+      const lease = await this.acquire(id);
+      try {
+        await this.delete(lease, id);
+      } finally {
+        await lease.release().catch(() => {});
+      }
+    });
   }
 
   private async root() {
@@ -322,6 +387,9 @@ export class FileSessionStore implements SessionStore, DurableClearSessionStore 
   }
 
   private async assertLease(lease: FileSessionLease): Promise<void> {
+    if (lease.released) {
+      throw new SessionError("SESSION_LOCKED", "Session lease is no longer held.");
+    }
     const raw = await readFile(lease.leasePath, "utf8").catch(() => null);
     if (!raw) {
       throw new SessionError("SESSION_LOCKED", "Session lease is no longer held.");
@@ -365,7 +433,7 @@ export class FileSessionStore implements SessionStore, DurableClearSessionStore 
     }
   }
 
-  private async writeNewLease(leasePath: string, payload: LeasePayload, force: boolean): Promise<void> {
+  private async writeNewLease(leasePath: string, payload: LeasePayload): Promise<void> {
     const write = async (flags: "w" | "wx") => {
       const handle = await open(leasePath, flags);
       try {
@@ -375,11 +443,6 @@ export class FileSessionStore implements SessionStore, DurableClearSessionStore 
         await handle.close();
       }
     };
-
-    if (force) {
-      await write("w");
-      return;
-    }
 
     try {
       await write("wx");
@@ -408,18 +471,29 @@ export class FileSessionStore implements SessionStore, DurableClearSessionStore 
   }
 
   private async refreshHeartbeat(lease: FileSessionLease, payload: LeasePayload): Promise<void> {
-    if (lease.released) return;
-    await this.assertLease(lease);
-    const next: LeasePayload = { ...payload, heartbeatAt: this.now() };
-    const handle = await open(lease.leasePath, "r+");
-    try {
-      await handle.truncate(0);
-      await handle.writeFile(`${JSON.stringify(next, stableJsonReplacer, 2)}\n`, "utf8");
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    payload.heartbeatAt = next.heartbeatAt;
+    await this.withLeaseFileOperation(lease, async () => {
+      if (lease.released) return;
+      await this.assertLease(lease);
+      const next: LeasePayload = { ...payload, heartbeatAt: this.now() };
+      const handle = await open(lease.leasePath, "r+");
+      try {
+        await handle.truncate(0);
+        await handle.writeFile(`${JSON.stringify(next, stableJsonReplacer, 2)}\n`, "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      payload.heartbeatAt = next.heartbeatAt;
+    });
+  }
+
+  private async withLeaseFileOperation<T>(lease: FileSessionLease, operation: () => Promise<T>): Promise<T> {
+    const task = lease.fileTail.then(operation, operation);
+    lease.fileTail = task.then(
+      () => undefined,
+      () => undefined,
+    );
+    return task;
   }
 
   private async tryClearStaleLease(leasePath: string): Promise<boolean> {

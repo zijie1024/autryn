@@ -97,20 +97,13 @@ export function registerSessionCommands(program: Command): void {
       await runSessionCommand(async () => {
         const store = new FileSessionStore();
         const target = resolveSessionSelector(selector, await store.list({ includeAllProjects: true }));
-        const lease = await store.acquire(target.id);
-        try {
-          const current = await store.load(target.id);
-          const next = {
-            ...current,
-            revision: current.revision + 1,
-            name: normalizeSessionName(name),
-            updatedAt: new Date().toISOString(),
-          };
-          await store.commit(lease, current.revision, next);
-          console.info(`Renamed ${target.shortId} to "${next.name}".`);
-        } finally {
-          await lease.release();
-        }
+        const next = await store.mutate(target.id, (current) => ({
+          ...current,
+          revision: current.revision + 1,
+          name: normalizeSessionName(name),
+          updatedAt: new Date().toISOString(),
+        }));
+        console.info(`Renamed ${target.shortId} to "${next.name}".`);
       });
     });
 
@@ -122,13 +115,8 @@ export function registerSessionCommands(program: Command): void {
       await runSessionCommand(async () => {
         const store = new FileSessionStore();
         const target = resolveSessionSelector(selector, await store.list({ includeAllProjects: true }));
-        const lease = await store.acquire(target.id);
-        try {
-          await store.delete(lease, target.id);
-          console.info(`Deleted session ${target.shortId}.`);
-        } finally {
-          await lease.release().catch(() => {});
-        }
+        await store.deleteSession(target.id);
+        console.info(`Deleted session ${target.shortId}.`);
       });
     });
 

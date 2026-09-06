@@ -1,5 +1,5 @@
 import type { AssistantMessage, ToolMessage } from "@/core";
-import type { CompactionLevel } from "@/runtime/context/types";
+import type { CompactionLevel, ContextPreparePath } from "@/runtime/context/types";
 import type { ExecutionErrorInfo } from "@/runtime/execution/types";
 
 /** {@link AgentEvent.type} 的判别值。 */
@@ -48,6 +48,10 @@ export interface AgentContextEvent {
   sourceTokens?: number;
   resultTokens?: number;
   nodeIds?: string[];
+  path?: ContextPreparePath;
+  reusedNodeCount?: number;
+  createdNodeCount?: number;
+  compactedTurnCount?: number;
   error?: ExecutionErrorInfo;
 }
 

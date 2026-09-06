@@ -6,24 +6,27 @@ import { DelegationScheduler } from "@/runtime/delegation/scheduler";
 import { AgentExecution, executionError } from "@/runtime/execution/agent-execution";
 import { AgentRun } from "@/runtime/execution/agent-run";
 import { ExecutionBranch } from "@/runtime/execution/execution-branch";
-import type {
-  AgentConfiguration,
-  AgentRunOptions,
-  DelegateDefinition,
-  DelegationLimits,
-  DelegationRequest,
-  DelegationResult,
-  DelegationStartResult,
-  DryRunEntry,
-  ExecutionBranchSnapshot,
-  ExecutionErrorInfo,
-  ExecutionSnapshot,
-  ExecutionTreeSnapshot,
-  HandoffDefinition,
-  HandoffRecord,
-  RuntimeEventListener,
+import {
+  DEFAULT_DELEGATION_LIMITS,
+  ExecutionCheckpointError,
+  type AgentConfiguration,
+  type AgentRunOptions,
+  type DelegateDefinition,
+  type DelegationLimits,
+  type DelegationRequest,
+  type DelegationResult,
+  type DelegationStartResult,
+  type DryRunEntry,
+  type ExecutionBranchSnapshot,
+  type ExecutionCheckpoint,
+  type ExecutionCheckpointHandler,
+  type ExecutionErrorInfo,
+  type ExecutionSnapshot,
+  type ExecutionTreeSnapshot,
+  type HandoffDefinition,
+  type HandoffRecord,
+  type RuntimeEventListener,
 } from "@/runtime/execution/types";
-import { DEFAULT_DELEGATION_LIMITS } from "@/runtime/execution/types";
 import { aggregateTree } from "@/runtime/resources/resource-ledger";
 import { formatToolResultForMessage } from "@/runtime/tool-results/runtime";
 import { DryRunReportBuilder } from "@/runtime/tools/dry-run-report";
@@ -71,6 +74,7 @@ export class AgentRuntime {
   private readonly retainedTrees = new Map<string, ExecutionTreeSnapshot>();
   private readonly retainedTreeOrder: string[] = [];
   private readonly observers = new Set<RuntimeEventListener>();
+  private readonly checkpointHandlers = new Map<string, ExecutionCheckpointHandler>();
 
   constructor(options: AgentRuntimeOptions = {}) {
     this.limits = { ...DEFAULT_DELEGATION_LIMITS, ...(options.limits ?? {}) };
@@ -113,6 +117,9 @@ export class AgentRuntime {
       },
     });
     this.branches.set(branchId, branch);
+    if (options.options?.onCheckpoint) {
+      this.checkpointHandlers.set(id, options.options.onCheckpoint);
+    }
     if (options.agent.contextManager) this.branchContextManagers.set(branchId, options.agent.contextManager);
     const run = new AgentRun(branch, execution);
     queueMicrotask(() => {
@@ -121,6 +128,29 @@ export class AgentRuntime {
       void options.run(execution);
     });
     return run;
+  }
+
+  async checkpoint(
+    execution: AgentExecution,
+    input: Pick<ExecutionCheckpoint, "reason" | "messages" | "handoff">,
+  ): Promise<void> {
+    const handler = this.checkpointHandlers.get(execution.rootExecutionId);
+    if (!handler) return;
+    try {
+      await handler({
+        reason: input.reason,
+        executionId: execution.id,
+        rootExecutionId: execution.rootExecutionId,
+        branchId: execution.branchId,
+        agentId: execution.agentId,
+        step: execution.getSnapshot().steps,
+        messages: input.messages,
+        ...(input.handoff ? { handoff: input.handoff } : {}),
+      });
+    } catch (error) {
+      if (error instanceof ExecutionCheckpointError) throw error;
+      throw new ExecutionCheckpointError(error);
+    }
   }
 
   startDelegation(parent: AgentExecution, request: DelegationRequest): DelegationStartResult {
@@ -500,6 +530,7 @@ export class AgentRuntime {
     for (const [branchId, branch] of this.branches) {
       if (branch.rootExecutionId === execution.rootExecutionId) this.branchContextManagers.delete(branchId);
     }
+    this.checkpointHandlers.delete(execution.rootExecutionId);
   }
 
   async handoff<I extends Record<string, unknown>>(
@@ -686,6 +717,19 @@ export class AgentRuntime {
     if (this.isTreeTokenLimitExceeded(source)) {
       return this.rejectHandoff(source, options.target, "TOKEN_LIMIT_EXCEEDED", "Execution tree token limit exceeded.");
     }
+    const record: HandoffRecord = {
+      sourceExecutionId: source.id,
+      successorExecutionId: id,
+      sourceAgentId: source.agentId,
+      targetAgentId: definition.target,
+      sequence: result.data.sequence,
+      committedAt: this.now(),
+    };
+    await this.checkpoint(source, {
+      reason: "handoff_committed",
+      messages: confirmationMessage ? [confirmationMessage] : [],
+      handoff: record,
+    });
     const successorExecution = this.createExecution({
       id,
       branchId: source.branchId,
@@ -701,14 +745,6 @@ export class AgentRuntime {
       mode: source.mode,
       deadlineAt: source.deadlineAt,
     });
-    const record: HandoffRecord = {
-      sourceExecutionId: source.id,
-      successorExecutionId: successorExecution.id,
-      sourceAgentId: source.agentId,
-      targetAgentId: definition.target,
-      sequence: result.data.sequence,
-      committedAt: this.now(),
-    };
     if (confirmationMessage) {
       source.appendMessage(confirmationMessage);
       source.emitAgentEvent({ type: "message", message: confirmationMessage });

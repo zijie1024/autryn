@@ -9,13 +9,14 @@ import {
   RuntimeContextManager,
   AgentRuntime,
   type Agent,
+  type ContextPhaseState,
+  type ContextSourceMessage,
   type ExecutionBranchResult,
   type HandoffEvent,
 } from "@/runtime";
 import type { AgentEvent } from "@/runtime/events/agent-event";
 import type {
   LoadedSession,
-  PersistedTurn,
   PersistedPhase,
   PersistedSessionMessage,
   SessionLease,
@@ -28,6 +29,7 @@ import { SettingsLoader } from "@/terminal/settings";
 import { AgentRegistry, type FrozenAgentGroup } from "./agent-registry";
 import { createTerminalMemoryRuntime, type TerminalMemoryStatus } from "./memory-runtime";
 import type { ModelResolver, ResolvedModel } from "./model-resolver";
+import { SessionCommitCoordinator } from "./session-commit-coordinator";
 
 export interface TerminalConfigurationSource {
   loadTurnConfiguration(): { modelResolver: ModelResolver; agentRegistry: AgentRegistry };
@@ -252,11 +254,9 @@ export class SessionController {
       await this.newDraft();
       return;
     }
-    const lease = await this.store.acquire(this.current.id);
     try {
-      await this.store.delete(lease, this.current.id);
+      await this.store.deleteSession(this.current.id);
     } finally {
-      await lease.release().catch(() => {});
       if (this.attachedLease) {
         await this.attachedLease.release().catch(() => {});
         this.attachedLease = null;
@@ -318,46 +318,45 @@ export class SessionController {
     const resolved = activeProfile.resolvedModel;
     await this.attachDraftBeforeMaterialize();
     const previousMessages = this.messages();
-    const started = await this.service.beginTurn(this.current, {
-      id: frozenGroup.id,
-      revision: frozenGroup.revision,
-    });
+    const userMessage: UserMessage = { role: "user", content: [{ type: "text", text }] };
+    const started = await this.service.startTurn(
+      this.current,
+      { id: frozenGroup.id, revision: frozenGroup.revision },
+      userMessage,
+      this.shouldCreateContextManager(resolved) ? DEFAULT_CONTEXT_POLICY.policyVersion : undefined,
+    );
     this.current = started.record;
     const turnMode = started.turn.executionMode;
     await this.ensureAttached();
-    const userMessage: UserMessage = { role: "user", content: [{ type: "text", text }] };
-    this.current = await this.service.appendMessages(this.current.id, started.turn.id, [userMessage]);
     options.onMessage?.(userMessage);
-    if (this.shouldCreateContextManager(resolved)) {
-      this.current = await this.service.ensureCompactionState(
-        this.current.id,
-        started.turn.id,
-        DEFAULT_CONTEXT_POLICY.policyVersion,
-      );
-    }
-    const contextManager = this.createContextManager(frozenGroup);
+    const contextState = this.createContextManager(frozenGroup);
+    const contextManager = contextState.manager;
+    let contextSourceSnapshot = contextState.sources;
     const memoryRuntime = await createTerminalMemoryRuntime({
       cwd: this.current.workspace.cwd,
     });
     const approvalState = { allowedTools: await new SettingsLoader().loadAllowList(this.current.workspace.cwd) };
     let agent: Agent;
     const runtime = new AgentRuntime();
-    const modelCalls = new Map<string, { agentId: string; model: string }>();
-    let modelPersistence = Promise.resolve();
+    const coordinator = new SessionCommitCoordinator(this.service, this.current.id, started.turn.id, (record) => {
+      this.current = record;
+      contextSourceSnapshot = appendContextSources(contextSourceSnapshot, record.messages, record.revision, record.compaction.phases);
+      contextManager?.updateSources(
+        contextSourceSnapshot,
+        record.revision,
+        activeContextPhases(record.compaction.phases),
+        record.compaction.checkpoint,
+      );
+    });
     const unsubscribeRuntime = runtime.subscribe((event) => {
       if (event.type === "model_call") {
-        modelCalls.set(event.executionId, { agentId: event.agentId, model: event.model });
         const profile = frozenGroup.agents.get(event.agentId);
         if (profile) {
-          modelPersistence = modelPersistence
-            .then(() =>
-              this.service.appendEffectiveModel(this.current.id, started.turn.id, {
-                executionId: event.executionId,
-                agentId: event.agentId,
-                ...profile.resolvedModel.effective,
-              }),
-            )
-            .then(() => undefined);
+          coordinator.addEffectiveModel({
+            executionId: event.executionId,
+            agentId: event.agentId,
+            ...profile.resolvedModel.effective,
+          });
         }
       }
     });
@@ -374,57 +373,48 @@ export class SessionController {
     } catch (error) {
       unsubscribeRuntime();
       const failed = failedBranchResult(this.current.activeAgentId, turnMode, error);
-      this.current = await this.service.finishTurn(this.current.id, started.turn.id, failed);
+      this.current = await coordinator.finish(failed);
       throw error;
     }
     this.activeExecution = agent;
 
     try {
       agent.setRequestedSkillName(options.requestedSkillName ?? null);
-      const run = agent.execute(userMessage, { mode: turnMode });
+      const run = agent.execute(userMessage, {
+        mode: turnMode,
+        onCheckpoint: async (checkpoint) => {
+          await coordinator.checkpoint(checkpoint);
+        },
+      });
       for await (const event of run.events) {
         if (event.type === "message") {
-          this.current = await this.service.appendMessages(this.current.id, started.turn.id, [event.message]);
           options.onMessage?.(event.message);
         } else if (event.type === "progress") {
           options.onProgress?.(event);
         } else if (event.type === "context") {
           options.onProgress?.(event);
         } else if (event.type === "handoff") {
-          if (event.status === "committed") {
-            this.current = await this.service.recordHandoff(this.current.id, started.turn.id, event.record);
-          }
           options.onHandoff?.(event);
         }
       }
       const result = await run.result;
-      await modelPersistence;
-      this.current = await this.service.finishTurn(
-        this.current.id,
-        started.turn.id,
-        result,
-        effectiveModelsForCalls(modelCalls, frozenGroup),
-      );
       const pendingPhase = contextManager?.consumePendingPhaseTransition();
-      if (result.status === "completed" && pendingPhase) {
-        this.current = await this.service.transitionCompactionPhase(
-          this.current.id,
-          started.turn.id,
-          pendingPhase.objective,
-          DEFAULT_CONTEXT_POLICY.policyVersion,
-        );
-      }
+      this.current = await coordinator.finish(result, {
+        finalMessage: result.output?.message,
+        ...(result.status === "completed" && pendingPhase
+          ? {
+              phaseTransition: {
+                nextObjective: pendingPhase.objective,
+                policyVersion: DEFAULT_CONTEXT_POLICY.policyVersion,
+              },
+            }
+          : {}),
+      });
       return result;
     } catch (error) {
       agent.abort();
-      await modelPersistence.catch(() => {});
       const failed = failedBranchResult(started.turn.initialAgentId, turnMode, error);
-      this.current = await this.service.finishTurn(
-        this.current.id,
-        started.turn.id,
-        failed,
-        effectiveModelsForCalls(modelCalls, frozenGroup),
-      );
+      this.current = await coordinator.finish(failed);
       throw error;
     } finally {
       agent.setRequestedSkillName(null);
@@ -486,14 +476,21 @@ export class SessionController {
     this.attachedLease = await this.store.acquire(this.current.id, { create: true });
   }
 
-  private createContextManager(group: FrozenAgentGroup): RuntimeContextManager | undefined {
+  private createContextManager(group: FrozenAgentGroup): {
+    manager: RuntimeContextManager | undefined;
+    sources: ContextSourceMessage[];
+  } {
     if (![...group.agents.values()].some((profile) => this.shouldCreateContextManager(profile.resolvedModel)))
-      return undefined;
+      return { manager: undefined, sources: [] };
     const resolved =
       group.agents.get(this.current.activeAgentId)?.resolvedModel ?? [...group.agents.values()][0]?.resolvedModel;
-    if (!resolved) return undefined;
+    if (!resolved) return { manager: undefined, sources: [] };
     const summaryModel = this.modelResolver.summaryModel(resolved);
-    return new RuntimeContextManager({
+    const sources =
+      "materialized" in this.current
+        ? []
+        : contextSources(this.current.messages, this.current.revision, this.current.compaction.phases);
+    const manager = new RuntimeContextManager({
       summarizer: new ModelContextSummarizer(summaryModel.model),
       enabledForModel: (model) => {
         const profile = [...group.agents.values()].find((candidate) => candidate.resolvedModel.model === model);
@@ -505,24 +502,22 @@ export class SessionController {
           profile ? this.modelResolver.summaryModel(profile.resolvedModel).model : summaryModel.model,
         );
       },
-      initialNodes: "materialized" in this.current ? [] : this.current.compaction.nodes,
-      initialFrontierNodeIds: "materialized" in this.current ? [] : this.current.compaction.checkpoint.frontierNodeIds,
-      sourceRevision: "materialized" in this.current ? undefined : this.current.revision,
-      onCompaction: async (result) => {
-        if ("materialized" in this.current) return;
-        this.current = await this.service.appendCompactionNodes(this.current.id, {
-          nodes: result.nodes,
-          frontierNodeIds: result.frontierNodeIds,
-          policyVersion: result.policyVersion,
-          summarySchemaVersion: result.summarySchemaVersion,
-          ...(result.sourceRevision ? { sourceRevision: result.sourceRevision } : {}),
-        });
-      },
-      sources:
+      restoreState:
         "materialized" in this.current
-          ? []
-          : contextSources(this.current.messages, this.current.revision, this.current.compaction.phases),
+          ? undefined
+          : {
+              currentSourceRevision: this.current.revision,
+              sources,
+              phases: activeContextPhases(this.current.compaction.phases),
+              nodes: this.current.compaction.nodes,
+              checkpoint: this.current.compaction.checkpoint,
+            },
+      onStateUpdate: async (update) => {
+        if ("materialized" in this.current) return;
+        this.current = await this.service.commitCompactionState(this.current.id, update);
+      },
     });
+    return { manager, sources };
   }
 
   private shouldCreateContextManager(resolved: ResolvedModel): boolean {
@@ -554,19 +549,6 @@ function failedBranchResult(agentId: string, mode: ExecutionMode, error: unknown
   };
 }
 
-function effectiveModelsForCalls(
-  calls: ReadonlyMap<string, { agentId: string; model: string }>,
-  group: FrozenAgentGroup,
-): PersistedTurn["effectiveModels"] {
-  const uses: PersistedTurn["effectiveModels"] = [];
-  for (const [executionId, call] of calls) {
-    const { agentId, model } = call;
-    const profile = group.agents.get(agentId);
-    if (profile) uses.push({ executionId, agentId, ...profile.resolvedModel.effective, model });
-  }
-  return uses;
-}
-
 function toMemoryStatusLayer(
   scope: "global" | "project",
   scopeId: string,
@@ -596,20 +578,21 @@ export function contextSources(
   phases: PersistedPhase[] = [],
 ) {
   const turnIndexById = new Map<string, number>();
+  const turnIds: string[] = [];
   const phaseByTurnId = new Map<string, Pick<PersistedPhase, "id" | "status">>();
   for (const message of messages) {
     if (!turnIndexById.has(message.turnId)) {
       turnIndexById.set(message.turnId, turnIndexById.size);
+      turnIds.push(message.turnId);
     }
   }
   for (const phase of phases) {
     const start = turnIndexById.get(phase.startedTurnId);
-    const end = phase.endedTurnId ? turnIndexById.get(phase.endedTurnId) : turnIndexById.size - 1;
+    const end = phase.endedTurnId ? turnIndexById.get(phase.endedTurnId) : turnIds.length - 1;
     if (start === undefined || end === undefined) continue;
-    for (const [turnId, turnIndex] of turnIndexById) {
-      if (turnIndex >= start && turnIndex <= end) {
-        phaseByTurnId.set(turnId, phase);
-      }
+    for (let turnIndex = start; turnIndex <= end; turnIndex++) {
+      const turnId = turnIds[turnIndex];
+      if (turnId) phaseByTurnId.set(turnId, phase);
     }
   }
   return messages.map((entry) => {
@@ -622,6 +605,59 @@ export function contextSources(
       sourceRevision,
     };
   });
+}
+
+function appendContextSources(
+  current: ContextSourceMessage[],
+  messages: PersistedSessionMessage[],
+  sourceRevision: number,
+  phases: PersistedPhase[],
+): ContextSourceMessage[] {
+  if (current.length > messages.length) return contextSources(messages, sourceRevision, phases);
+  const lastCurrent = current.at(-1);
+  const matchingMessage = lastCurrent ? messages[current.length - 1] : undefined;
+  if (
+    lastCurrent &&
+    (matchingMessage?.id !== lastCurrent.messageId || matchingMessage.turnId !== lastCurrent.turnId)
+  ) {
+    return contextSources(messages, sourceRevision, phases);
+  }
+
+  const activePhase = activeContextPhases(phases)[0];
+  if (
+    lastCurrent &&
+    ((activePhase?.id ?? undefined) !== lastCurrent.phaseId ||
+      (activePhase?.status ?? undefined) !== lastCurrent.phaseStatus)
+  ) {
+    return contextSources(messages, sourceRevision, phases);
+  }
+
+  let lastTurnId = lastCurrent?.turnId;
+  let turnIndex = lastCurrent?.turnIndex ?? -1;
+  for (let index = current.length; index < messages.length; index++) {
+    const entry = messages[index]!;
+    if (entry.turnId !== lastTurnId) {
+      lastTurnId = entry.turnId;
+      turnIndex++;
+    }
+    current.push({
+      messageId: entry.id,
+      turnId: entry.turnId,
+      turnIndex,
+      ...(activePhase ? { phaseId: activePhase.id, phaseStatus: activePhase.status } : {}),
+      sourceRevision,
+    });
+  }
+  return current;
+}
+
+function activeContextPhases(phases: PersistedPhase[]): ContextPhaseState[] {
+  for (let index = phases.length - 1; index >= 0; index--) {
+    const phase = phases[index]!;
+    if (phase.status !== "active") continue;
+    return [{ id: phase.id, status: phase.status, startedTurnId: phase.startedTurnId }];
+  }
+  return [];
 }
 
 function directoryExists(file: string): boolean {
