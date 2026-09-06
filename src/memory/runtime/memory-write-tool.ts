@@ -10,7 +10,7 @@ import { emitMemoryEvent, type MemoryObserver } from "./memory-events";
 import { memoryReferenceSchema } from "./memory-schemas";
 import { memoryErrorCode, memoryErrorResult, okToolResult } from "./memory-tool-utils";
 
-const memoryWriteParameters = z.object({
+export const memoryWriteParameters = z.object({
   mutation: z.discriminatedUnion("type", [
     z.object({ type: z.literal("create"), reference: memoryReferenceSchema, content: z.string() }),
     z.object({

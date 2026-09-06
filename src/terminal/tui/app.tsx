@@ -1,7 +1,5 @@
-import { Box, Text, useStdout } from "ink";
-import { useEffect, useMemo, useRef } from "react";
-
-import type { NonSystemMessage } from "@/core";
+import { Box, Static, Text } from "ink";
+import { useMemo } from "react";
 
 import type { SlashCommand } from "./command-registry";
 import { ApprovalPrompt } from "./components/approval-prompt";
@@ -15,7 +13,6 @@ import { TodoPanel } from "./components/todo-panel";
 import { useAgentLoop } from "./hooks/use-agent-loop";
 import { useApprovalManager } from "./hooks/use-approval-manager";
 import { useAskUserQuestionManager } from "./hooks/use-ask-user-question-manager";
-import { messageToPlainText } from "./message-text";
 import { currentTheme } from "./themes";
 import { buildTodoViewState, getNextTodo } from "./todo-view";
 
@@ -30,24 +27,30 @@ export function App({
   commands: SlashCommand[];
   supportProjectWideAllow?: boolean;
 }) {
-  const { streaming, activity, messages, onSubmit, abort } = useAgentLoop();
+  const { streaming, activity, messages, historyEpoch, onSubmit, abort } = useAgentLoop();
   const { approvalRequest, respondToApproval } = useApprovalManager();
   const { askUserQuestionRequest, respondWithAnswers } = useAskUserQuestionManager();
   const { latestTodos, todoSnapshots } = useMemo(() => buildTodoViewState(messages), [messages]);
   const nextTodo = getNextTodo(latestTodos)?.content;
   const hideTodos = !streaming && allDone(latestTodos);
 
-  const { write } = useStdout();
-  const flushedRef = useRef(0);
-
   const lastMessage = messages.length > 0 ? messages[messages.length - 1]! : undefined;
-
-  useFlushToScrollback(messages, flushedRef, write);
+  const completedMessages = messages.slice(0, -1);
 
   return (
     <Box flexDirection="column" width="100%">
+      <Static key={historyEpoch} items={completedMessages}>
+        {(message, index) => (
+          <MessageHistoryItem
+            key={`history:${index}:${message.role}`}
+            message={message}
+            messageIndex={index}
+            todoSnapshots={todoSnapshots}
+          />
+        )}
+      </Static>
       {messages.length === 0 && <Header />}
-      <Box flexDirection="column" marginTop={1} rowGap={1}>
+      <Box flexDirection="column" marginTop={messages.length === 0 ? 1 : 0} rowGap={1}>
         {lastMessage && (
           <MessageHistoryItem
             key={`msg:${lastMessage.role}:${messages.length - 1}`}
@@ -77,24 +80,4 @@ export function App({
       <Footer />
     </Box>
   );
-}
-
-function useFlushToScrollback(
-  messages: NonSystemMessage[],
-  flushedRef: React.MutableRefObject<number>,
-  write: (data: string) => void,
-) {
-  useEffect(() => {
-    const targetCount = messages.length > 0 ? messages.length - 1 : 0;
-    if (targetCount <= flushedRef.current) return;
-
-    const toFlush = messages.slice(flushedRef.current, targetCount);
-    for (const msg of toFlush) {
-      const text = messageToPlainText(msg);
-      if (text) {
-        write(text + "\n");
-      }
-    }
-    flushedRef.current = targetCount;
-  }, [messages, write, flushedRef]);
 }

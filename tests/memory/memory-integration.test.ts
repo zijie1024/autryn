@@ -49,6 +49,10 @@ describe("createMemoryIntegration", () => {
     const { scope, service } = serviceWith();
     const result = createProjectIntegration(service, scope, policy("read_write", true));
     expect(result.tools.map((t) => t.name)).toEqual(["memory_read", "memory_write"]);
+    for (const tool of result.tools) {
+      const schema = tool.parameters.toJSONSchema() as { type?: unknown };
+      expect(schema.type).toBe("object");
+    }
   });
 
   test("read_write without autoWrite registers only memory_read", () => {

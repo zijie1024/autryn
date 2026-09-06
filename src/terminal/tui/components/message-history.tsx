@@ -19,7 +19,7 @@ export const MessageHistory = memo(function MessageHistory({
   todoSnapshots: Map<string, TodoItemView[]>;
 }) {
   return (
-    <Box flexDirection="column" rowGap={1} width="100%">
+    <Box flexDirection="column" width="100%">
       {messages.map((message, index) => {
         return (
           <MessageHistoryItem
@@ -45,7 +45,12 @@ export const MessageHistoryItem = memo(function MessageHistoryItem({
 }) {
   switch (message.role) {
     case "user":
-      return <UserMessageItem message={message} />;
+      return (
+        <Box flexDirection="column" width="100%">
+          {messageIndex > 0 && <Text> </Text>}
+          <UserMessageItem message={message} />
+        </Box>
+      );
     case "assistant":
       return <AssistantMessageItem message={message} todoSnapshots={todoSnapshots} messageIndex={messageIndex} />;
     case "tool":

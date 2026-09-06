@@ -10,10 +10,15 @@ import { emitMemoryEvent, type MemoryObserver } from "./memory-events";
 import { memoryReferenceSchema } from "./memory-schemas";
 import { memoryErrorResult, okToolResult } from "./memory-tool-utils";
 
-const memoryReadParameters = z.discriminatedUnion("command", [
-  z.object({ command: z.literal("list") }),
-  z.object({ command: z.literal("view"), reference: memoryReferenceSchema }),
-]);
+const memoryReadParameters = z
+  .object({
+    command: z.enum(["list", "view"]),
+    reference: memoryReferenceSchema.optional(),
+  })
+  .refine((input) => input.command !== "view" || input.reference !== undefined, {
+    message: "A memory reference is required for the view command.",
+    path: ["reference"],
+  });
 
 export function createMemoryReadTool(
   service: MemoryService,
@@ -42,6 +47,9 @@ export function createMemoryReadTool(
             })),
             totalBytes: snapshot.totalBytes,
           });
+        }
+        if (!input.reference) {
+          return memoryErrorResult(new Error("A memory reference is required for the view command."), "MEMORY_REFERENCE_INVALID");
         }
         const document = await service.view(scope, policy, input.reference);
         emitMemoryEvent(observer, {

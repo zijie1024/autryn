@@ -16,7 +16,7 @@ import type { MemoryService } from "./memory-service";
 import { emitMemoryEvent, type MemoryObserver } from "./runtime/memory-events";
 import { createMemoryReadTool } from "./runtime/memory-read-tool";
 import { memoryReferenceSchema } from "./runtime/memory-schemas";
-import { createMemoryWriteTool } from "./runtime/memory-write-tool";
+import { createMemoryWriteTool, memoryWriteParameters } from "./runtime/memory-write-tool";
 
 export interface MemoryIntegration {
   readonly adapterKind: string;
@@ -171,10 +171,20 @@ function createLayeredReadTool(
     MemoryLayerName | "all",
     ...(MemoryLayerName | "all")[],
   ];
-  const parameters = z.discriminatedUnion("command", [
-    z.object({ command: z.literal("list"), scope: z.enum(listNames) }),
-    z.object({ command: z.literal("view"), scope: z.enum(names), reference: memoryReferenceSchema }),
-  ]);
+  const parameters = z
+    .object({
+      command: z.enum(["list", "view"]),
+      scope: z.enum(listNames),
+      reference: memoryReferenceSchema.optional(),
+    })
+    .refine((input) => input.command !== "view" || input.scope !== "all", {
+      message: "The view command requires a concrete memory scope.",
+      path: ["scope"],
+    })
+    .refine((input) => input.command !== "view" || input.reference !== undefined, {
+      message: "A memory reference is required for the view command.",
+      path: ["reference"],
+    });
   return defineTool({
     name: "memory_read",
     description: "Read durable memory from an explicitly selected global or project scope.",
@@ -199,6 +209,9 @@ function createLayeredReadTool(
         }));
         return { ok: true, summary: `Listed ${groups.length} memory scopes.`, data: { scopes: groups } };
       }
+      if (input.command === "view" && (!input.reference || input.scope === "all")) {
+        return memoryScopeError(input.scope);
+      }
       const layer = layerByName.get(input.scope as MemoryLayerName);
       if (!layer) return memoryScopeError(input.scope);
       const tool = createMemoryReadTool(service, layer.scope, layer.policy, observer);
@@ -217,9 +230,7 @@ function createLayeredWriteTool(
 ): Tool {
   const layerByName = new Map(layers.map((layer) => [layer.name, layer]));
   const names = layers.map((layer) => layer.name) as [MemoryLayerName, ...MemoryLayerName[]];
-  const first = layers[0]!;
-  const base = createMemoryWriteTool(service, first.scope, first.policy, observer);
-  const parameters = z.intersection(z.object({ scope: z.enum(names) }), base.parameters);
+  const parameters = memoryWriteParameters.extend({ scope: z.enum(names) });
   return defineTool({
     name: "memory_write",
     description: "Create, update, rename, or delete durable memory in an explicitly selected global or project scope.",

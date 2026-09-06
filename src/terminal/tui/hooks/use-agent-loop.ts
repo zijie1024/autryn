@@ -16,6 +16,7 @@ type AgentLoopState = {
   streaming: boolean;
   activity: string | null;
   messages: NonSystemMessage[];
+  historyEpoch: number;
   onSubmit: (submission: PromptSubmission) => Promise<void>;
   abort: () => void;
   tokenUsage: TokenUsageSummary;
@@ -38,6 +39,7 @@ export function AgentLoopProvider({
   const [activity, setActivity] = useState<string | null>(null);
   const [messages, setMessages] = useState<NonSystemMessage[]>(() => sessionController?.messages() ?? []);
   const [session, setSession] = useState<SessionControllerSnapshot | null>(() => sessionController?.snapshot() ?? null);
+  const [historyEpoch, setHistoryEpoch] = useState(0);
 
   const streamingRef = useRef(streaming);
   const pendingMessagesRef = useRef<NonSystemMessage[]>([]);
@@ -130,6 +132,7 @@ export function AgentLoopProvider({
             flushPendingMessages();
             setMessages(sessionController.messages());
             setSession(sessionController.snapshot());
+            setHistoryEpoch((epoch) => epoch + 1);
             clearTerminal();
           } catch (error) {
             appendAssistantError(error, setMessages);
@@ -139,6 +142,7 @@ export function AgentLoopProvider({
         agent?.clearMessages();
         flushPendingMessages();
         setMessages([]);
+        setHistoryEpoch((epoch) => epoch + 1);
         clearTerminal();
         return;
       }
@@ -181,6 +185,7 @@ export function AgentLoopProvider({
           setMessages,
           setSession,
           flushPendingMessages,
+          resetHistory: () => setHistoryEpoch((epoch) => epoch + 1),
         });
         if (handled) return;
       }
@@ -211,6 +216,10 @@ export function AgentLoopProvider({
               setSession(sessionController.snapshot());
             },
           });
+          if (result.status !== "completed" && result.status !== "cancelled") {
+            const reason = result.error?.message ?? `Execution ${result.status}.`;
+            enqueueMessage(assistantText(`Error: ${reason}\n\nYou can try again.`));
+          }
           if (result.dryRunReport) {
             const { previews, blocked } = result.dryRunReport.summary;
             setActivity(`DRY-RUN · ${previews} previewed · ${blocked} blocked · report saved to Session`);
@@ -257,11 +266,12 @@ export function AgentLoopProvider({
       streaming,
       activity,
       messages,
+      historyEpoch,
       onSubmit,
       abort,
       tokenUsage,
     }),
-    [abort, activity, agent, messages, onSubmit, session, streaming, tokenUsage],
+    [abort, activity, agent, historyEpoch, messages, onSubmit, session, streaming, tokenUsage],
   );
 
   return createElement(AgentLoopContext.Provider, { value }, children);
@@ -388,6 +398,7 @@ async function handleSessionCommand(
     setMessages: (value: SetStateAction<NonSystemMessage[]>) => void;
     setSession: (value: SetStateAction<SessionControllerSnapshot | null>) => void;
     flushPendingMessages: () => void;
+    resetHistory: () => void;
   },
 ): Promise<boolean> {
   const append = (text: string) => ui.setMessages((prev) => [...prev, assistantText(text)]);
@@ -420,6 +431,7 @@ async function handleSessionCommand(
       ui.flushPendingMessages();
       ui.setMessages(controller.messages());
       ui.setSession(controller.snapshot());
+      ui.resetHistory();
       append(`Resumed ${controller.snapshot().displayName}.`);
       return true;
     }
@@ -428,6 +440,7 @@ async function handleSessionCommand(
       ui.flushPendingMessages();
       ui.setMessages([]);
       ui.setSession(controller.snapshot());
+      ui.resetHistory();
       append(`Started ${controller.snapshot().displayName}.`);
       return true;
     }
@@ -447,6 +460,7 @@ async function handleSessionCommand(
       ui.flushPendingMessages();
       ui.setMessages([]);
       ui.setSession(controller.snapshot());
+      ui.resetHistory();
       append("Deleted the session and started a new draft.");
       return true;
     }
