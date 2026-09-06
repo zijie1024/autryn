@@ -39,6 +39,7 @@ interface FileSessionLease extends SessionLease {
   dir: string;
   leasePath: string;
   heartbeatTimer: ReturnType<typeof setInterval> | null;
+  heartbeatTask: Promise<void> | null;
   released: boolean;
 }
 
@@ -161,6 +162,7 @@ export class FileSessionStore implements SessionStore, DurableClearSessionStore 
       dir,
       leasePath,
       heartbeatTimer: null,
+      heartbeatTask: null,
       released: false,
       release: async () => {
         await this.releaseLease(lease);
@@ -350,6 +352,7 @@ export class FileSessionStore implements SessionStore, DurableClearSessionStore 
       clearInterval(lease.heartbeatTimer);
       lease.heartbeatTimer = null;
     }
+    await lease.heartbeatTask?.catch(() => {});
     const raw = await readFile(lease.leasePath, "utf8").catch(() => null);
     if (!raw) return;
     try {
@@ -393,7 +396,12 @@ export class FileSessionStore implements SessionStore, DurableClearSessionStore 
   private startHeartbeat(lease: FileSessionLease, payload: LeasePayload): ReturnType<typeof setInterval> | null {
     if (this.heartbeatIntervalMs <= 0) return null;
     const timer = setInterval(() => {
-      void this.refreshHeartbeat(lease, payload).catch(() => {});
+      if (lease.heartbeatTask) return;
+      const heartbeatTask = this.refreshHeartbeat(lease, payload);
+      lease.heartbeatTask = heartbeatTask;
+      void heartbeatTask.catch(() => {}).finally(() => {
+        if (lease.heartbeatTask === heartbeatTask) lease.heartbeatTask = null;
+      });
     }, this.heartbeatIntervalMs);
     timer.unref?.();
     return timer;

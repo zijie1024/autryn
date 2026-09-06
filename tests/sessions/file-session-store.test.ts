@@ -106,9 +106,7 @@ describe("FileSessionStore", () => {
     const lease = await store.acquire(SESSION_ID, { create: true });
     const leasePath = path.join(sessionDirectory(root, SESSION_ID), "lease.json");
     const initial = JSON.parse(await readFile(leasePath, "utf8")) as { heartbeatAt: string };
-    await wait(30);
-    const updated = JSON.parse(await readFile(leasePath, "utf8")) as { heartbeatAt: string };
-    expect(updated.heartbeatAt).not.toBe(initial.heartbeatAt);
+    await waitForHeartbeatChange(leasePath, initial.heartbeatAt);
 
     await lease.release();
     expect(await exists(leasePath)).toBe(false);
@@ -281,4 +279,21 @@ async function exists(file: string): Promise<boolean> {
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForHeartbeatChange(file: string, previous: string): Promise<void> {
+  const deadline = Date.now() + 500;
+  while (Date.now() < deadline) {
+    const raw = await readFile(file, "utf8").catch(() => null);
+    if (raw) {
+      try {
+        const current = JSON.parse(raw) as { heartbeatAt?: string };
+        if (current.heartbeatAt && current.heartbeatAt !== previous) return;
+      } catch {
+        // The heartbeat may be between truncate and write; try again on the next poll.
+      }
+    }
+    await wait(5);
+  }
+  throw new Error("Timed out waiting for session lease heartbeat.");
 }
